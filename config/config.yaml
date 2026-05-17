@@ -1,0 +1,15 @@
+model:
+  base_model: "deepseek-coder:1.3b"  # Already available, optimized for coding
+  name: "rem-coder"
+
+training:
+  method: "modelfile"  # Ollama Modelfile approach (CPU-compatible)
+  epochs: 3
+
+data:
+  train_file: "data/train.jsonl"
+  val_file: "data/val.jsonl"
+  max_length: 2048
+
+hardware:
+  gpu_vram_gb: 0  # CPU-only mode

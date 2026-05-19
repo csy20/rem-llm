@@ -1,0 +1,2 @@
+[console_scripts]
+remllm = remllm.cli:main

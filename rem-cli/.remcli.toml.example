@@ -1,0 +1,5 @@
+model = "rem-coder-trained"
+ollama_url = "http://localhost:11434"
+timeout_s = 120
+max_context_bytes = 16000
+prompts_dir = "prompts"

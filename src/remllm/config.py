@@ -88,3 +88,28 @@ def load_config_dict(path: Path) -> dict:
     """Load raw YAML without Pydantic validation (legacy compat)."""
     with path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+
+def resolve_project_root(config_path: Path, data_file_hint: str = "") -> Path:
+    """Resolve repository root for both config/config.yaml and config/domains/*.yaml layouts."""
+    candidates = [
+        Path.cwd(),
+        config_path.parent.parent,
+        config_path.parent.parent.parent,
+    ]
+
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+
+    if data_file_hint:
+        for base in unique:
+            if (base / data_file_hint).exists():
+                return base
+
+    for base in unique:
+        if (base / "pyproject.toml").exists():
+            return base
+
+    return Path.cwd()

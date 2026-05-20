@@ -4,7 +4,7 @@ import argparse
 import random
 from pathlib import Path
 
-from remllm.config import load_config_dict
+from remllm.config import load_config_dict, resolve_project_root
 from remllm.data.loader import (
     build_dataset_fingerprint,
     count_lines,
@@ -18,7 +18,7 @@ from remllm.data.loader import (
 
 def prepare_data(config_path: Path, force: bool = False) -> None:
     config = load_config_dict(config_path)
-    root = config_path.parent.parent
+    root = resolve_project_root(config_path, str(config["data"]["raw_file"]))
     data_cfg = config["data"]
     seed = int(config["project"]["seed"])
     train_split = float(data_cfg["train_split"])

@@ -62,6 +62,13 @@ def run_full_evaluation(
     except ImportError:
         pass
 
+    try:
+        from remllm.eval.beginner_eval import BeginnerEvaluator
+
+        suite.add(BeginnerEvaluator())
+    except ImportError:
+        pass
+
     results = suite.run(model_name, rows, timeout_s=timeout_s)
     suite.write_reports(results, output_dir, prefix)
     summary = suite.summarize(results)

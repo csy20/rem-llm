@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from remllm.config import AppConfig, load_config, load_config_dict
+from remllm.config import AppConfig, load_config, load_config_dict, resolve_project_root
 
 
 VALID_CONFIG = {
@@ -47,3 +47,17 @@ def test_app_config_defaults():
 def test_config_missing_model():
     with pytest.raises(Exception):
         AppConfig.model_validate({})
+
+
+def test_resolve_project_root_prefers_cwd_when_pyproject_exists(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text("[build-system]\n", encoding="utf-8")
+    cfg_dir = repo / "config" / "domains"
+    cfg_dir.mkdir(parents=True)
+    cfg_path = cfg_dir / "domain.yaml"
+    cfg_path.write_text("data: {}\n", encoding="utf-8")
+
+    monkeypatch.chdir(repo)
+    root = resolve_project_root(cfg_path, "")
+    assert root == repo

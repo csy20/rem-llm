@@ -8,9 +8,11 @@ import subprocess
 from pathlib import Path
 
 from remllm import __version__
+from remllm.config import resolve_project_root
 from remllm.data.loader import load_jsonl
 from remllm.data.prepper import prepare_data
 from remllm.eval.benchmark import benchmark_models
+from remllm.eval.beginner_eval import BeginnerEvaluator
 from remllm.eval.comparator import compare_reports
 from remllm.eval.executable import ExecutableEvaluator
 from remllm.eval.quality import QualityEvaluator
@@ -25,10 +27,17 @@ def cmd_data_prepare(args: argparse.Namespace) -> None:
 
 
 def cmd_data_generate(args: argparse.Namespace) -> None:
-    from remllm.data.generator import generate_dataset, write_dataset, NEXTJS_TEMPLATES
+    from remllm.data.generator import (
+        BEGINNER_TEMPLATES,
+        NEXTJS_TEMPLATES,
+        generate_dataset,
+        write_dataset,
+    )
 
-    templates = NEXTJS_TEMPLATES
-    if args.domain != "all":
+    templates = NEXTJS_TEMPLATES + BEGINNER_TEMPLATES
+    if args.domain == "beginner":
+        templates = BEGINNER_TEMPLATES
+    elif args.domain != "all":
         templates = [t for t in templates if t.domain == args.domain]
     rows = generate_dataset(templates, seed=args.seed)
     write_dataset(rows, Path(args.output))
@@ -47,11 +56,11 @@ def cmd_data_generate(args: argparse.Namespace) -> None:
 
 def cmd_eval_quality(args: argparse.Namespace) -> None:
     config_path = Path(args.config)
-    root = config_path.parent.parent
     import yaml
 
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
+    root = resolve_project_root(config_path, str(config["data"]["eval_file"]))
     eval_path = root / config["data"]["eval_file"]
     rows = load_jsonl(eval_path)
     if not rows:
@@ -65,17 +74,35 @@ def cmd_eval_quality(args: argparse.Namespace) -> None:
 
 def cmd_eval_exec(args: argparse.Namespace) -> None:
     config_path = Path(args.config)
-    root = config_path.parent.parent
     import yaml
 
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
+    root = resolve_project_root(config_path, str(config["data"]["eval_file"]))
     eval_path = root / config["data"]["eval_file"]
     rows = load_jsonl(eval_path)
     if not rows:
         print(f"No eval rows found in {eval_path}")
         return
     evaluator = ExecutableEvaluator()
+    report = evaluator.evaluate(args.model, rows, timeout_s=args.timeout_s)
+    report.write(Path(args.report))
+    print(json.dumps(report.rates, indent=2))
+
+
+def cmd_eval_beginner(args: argparse.Namespace) -> None:
+    config_path = Path(args.config)
+    import yaml
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    root = resolve_project_root(config_path, str(config["data"]["eval_file"]))
+    eval_path = root / config["data"]["eval_file"]
+    rows = load_jsonl(eval_path)
+    if not rows:
+        print(f"No eval rows found in {eval_path}")
+        return
+    evaluator = BeginnerEvaluator()
     report = evaluator.evaluate(args.model, rows, timeout_s=args.timeout_s)
     report.write(Path(args.report))
     print(json.dumps(report.rates, indent=2))
@@ -240,7 +267,17 @@ def main():
     dp_gen.add_argument(
         "--domain",
         default="all",
-        choices=["all", "nextjs", "react", "prisma", "typescript"],
+        choices=[
+            "all",
+            "beginner",
+            "nextjs",
+            "react",
+            "prisma",
+            "typescript",
+            "html",
+            "css",
+            "terminal",
+        ],
     )
     dp_gen.add_argument("--seed", type=int, default=42)
 
@@ -257,6 +294,13 @@ def main():
     eq_exec.add_argument("--model", required=True)
     eq_exec.add_argument("--report", required=True)
     eq_exec.add_argument("--timeout-s", type=int, default=30)
+    eq_beginner = eq_sub.add_parser(
+        "beginner", help="Run beginner HTML/CSS/terminal evaluation"
+    )
+    eq_beginner.add_argument("--config", default="config/config.yaml")
+    eq_beginner.add_argument("--model", required=True)
+    eq_beginner.add_argument("--report", required=True)
+    eq_beginner.add_argument("--timeout-s", type=int, default=30)
     eq_bench = eq_sub.add_parser("benchmark", help="Benchmark model latency/throughput")
     eq_bench.add_argument("--models", required=True)
     eq_bench.add_argument("--eval-file", default="data/eval.jsonl")
@@ -313,17 +357,18 @@ def main():
         "data": lambda a: {
             "prepare": cmd_data_prepare,
             "generate": cmd_data_generate,
-        }.get(getattr(a, "data_command", None), lambda _: dp.print_help())(a),
+        }.get(str(getattr(a, "data_command", "") or ""), lambda _: dp.print_help())(a),
         "eval": lambda a: {
             "quality": cmd_eval_quality,
             "exec": cmd_eval_exec,
+            "beginner": cmd_eval_beginner,
             "benchmark": cmd_eval_benchmark,
-        }.get(getattr(a, "eval_command", None), lambda _: eq.print_help())(a),
+        }.get(str(getattr(a, "eval_command", "") or ""), lambda _: eq.print_help())(a),
         "compare": cmd_compare,
         "train": cmd_train,
         "merge": cmd_merge,
         "export": lambda a: {"gguf": cmd_export_gguf}.get(
-            getattr(a, "export_command", None), lambda _: ex.print_help()
+            str(getattr(a, "export_command", "") or ""), lambda _: ex.print_help()
         )(a),
         "package": cmd_package,
         "pipeline": cmd_pipeline,

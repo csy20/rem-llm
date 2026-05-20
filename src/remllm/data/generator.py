@@ -867,6 +867,151 @@ if (process.env.NODE_ENV !== 'production') {
 ]
 
 
+BEGINNER_TEMPLATES: list[PromptTemplate] = [
+    PromptTemplate(
+        instruction="Create a basic HTML5 page with a header, main section, and footer",
+        context={"constraints": ["Semantic tags", "Accessible structure"]},
+        output_template="""<!doctype html>
+<html lang=\"en\">
+  <head>
+    <meta charset=\"UTF-8\" />
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+    <title>Starter Page</title>
+  </head>
+  <body>
+    <header>
+      <h1>My Starter Page</h1>
+    </header>
+    <main>
+      <section>
+        <h2>Welcome</h2>
+        <p>This is a beginner HTML layout.</p>
+      </section>
+    </main>
+    <footer>
+      <p>Copyright 2026</p>
+    </footer>
+  </body>
+</html>""",
+        domain="html",
+        difficulty="easy",
+        tags=["html", "semantic", "structure"],
+    ),
+    PromptTemplate(
+        instruction="Style a card component with CSS using padding, border radius, and box shadow",
+        context={"constraints": ["Plain CSS", "Readable spacing"]},
+        output_template=""".card {
+  max-width: 320px;
+  padding: 16px;
+  border-radius: 12px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+}
+
+.card h2 {
+  margin: 0 0 8px;
+  font-size: 1.2rem;
+}
+
+.card p {
+  margin: 0;
+  color: #4b5563;
+}""",
+        domain="css",
+        difficulty="easy",
+        tags=["css", "card", "styling"],
+    ),
+    PromptTemplate(
+        instruction="Create a responsive two-column layout using CSS Grid that collapses to one column on mobile",
+        context={"constraints": ["Grid", "Mobile first"]},
+        output_template=""".layout {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+@media (min-width: 768px) {
+  .layout {
+    grid-template-columns: 2fr 1fr;
+  }
+}""",
+        domain="css",
+        difficulty="easy",
+        tags=["css", "grid", "responsive"],
+    ),
+    PromptTemplate(
+        instruction="Build an HTML form for signup with name, email, password, and submit button",
+        context={"constraints": ["Use labels", "Basic validation attributes"]},
+        output_template="""<form action=\"/signup\" method=\"post\">
+  <label for=\"name\">Name</label>
+  <input id=\"name\" name=\"name\" type=\"text\" required />
+
+  <label for=\"email\">Email</label>
+  <input id=\"email\" name=\"email\" type=\"email\" required />
+
+  <label for=\"password\">Password</label>
+  <input id=\"password\" name=\"password\" type=\"password\" minlength=\"8\" required />
+
+  <button type=\"submit\">Create account</button>
+</form>""",
+        domain="html",
+        difficulty="easy",
+        tags=["html", "forms", "accessibility"],
+    ),
+    PromptTemplate(
+        instruction="Explain and show safe terminal commands to create a project folder and an index.html file",
+        context={"constraints": ["Do not use sudo", "Beginner-safe sequence"]},
+        output_template="""# Create project folder
+mkdir my-site
+cd my-site
+
+# Create starter files
+touch index.html styles.css
+
+# Check results
+ls -la""",
+        domain="terminal",
+        difficulty="easy",
+        tags=["terminal", "filesystem", "beginner"],
+    ),
+    PromptTemplate(
+        instruction="Show beginner-safe command to copy a file and verify it exists",
+        context={"constraints": ["No destructive actions"]},
+        output_template="""cp index.html index.backup.html
+ls -la index.backup.html""",
+        domain="terminal",
+        difficulty="easy",
+        tags=["terminal", "copy", "verification"],
+    ),
+    PromptTemplate(
+        instruction="Create a simple navigation bar in HTML and style it with CSS flexbox",
+        context={"constraints": ["Basic desktop+mobile readiness"]},
+        output_template="""<nav class=\"nav\">
+  <a href=\"#\">Home</a>
+  <a href=\"#\">About</a>
+  <a href=\"#\">Contact</a>
+</nav>
+
+<style>
+  .nav {
+    display: flex;
+    gap: 12px;
+    padding: 12px;
+    background: #0f172a;
+  }
+  .nav a {
+    color: #f8fafc;
+    text-decoration: none;
+  }
+</style>""",
+        domain="html",
+        difficulty="easy",
+        tags=["html", "css", "flexbox"],
+    ),
+]
+
+
 def generate_dataset(
     templates: list[PromptTemplate],
     num_variations: int = 500,
@@ -906,13 +1051,25 @@ def main():
     parser.add_argument(
         "--domain",
         default="all",
-        choices=["all", "nextjs", "react", "prisma", "typescript"],
+        choices=[
+            "all",
+            "nextjs",
+            "react",
+            "prisma",
+            "typescript",
+            "html",
+            "css",
+            "terminal",
+            "beginner",
+        ],
     )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    all_templates = NEXTJS_TEMPLATES
-    if args.domain != "all":
+    all_templates = NEXTJS_TEMPLATES + BEGINNER_TEMPLATES
+    if args.domain == "beginner":
+        all_templates = BEGINNER_TEMPLATES
+    elif args.domain != "all":
         all_templates = [t for t in all_templates if t.domain == args.domain]
 
     rows = generate_dataset(all_templates, seed=args.seed)

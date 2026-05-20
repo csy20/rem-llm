@@ -1,9 +1,9 @@
 {
   "fingerprint": {
-    "raw_file": "data/raw.jsonl",
-    "raw_sha256": "f40e30fe08be3792afb086f262b53fe3e7a6d313b8feaabc93d83290daea1102",
+    "raw_file": "/tmp/tmp4b92861q/data/raw.jsonl",
+    "raw_sha256": "1d85f5df58a8ec834944c4d4765f5a1269dec3462514a5aa241691cfd8f13b14",
     "seed": 42,
-    "train_split": 0.9,
+    "train_split": 0.8,
     "required_keys": [
       "instruction",
       "input",
@@ -12,9 +12,9 @@
     "schema_version": 1
   },
   "stats": {
-    "raw_rows": 10,
+    "raw_rows": 3,
     "dropped_rows": 0,
-    "train_rows": 9,
+    "train_rows": 2,
     "val_rows": 1,
     "eval_rows": 1
   }

@@ -12,6 +12,26 @@ This project trains a coding assistant model named `rem-coder` using a 7-phase w
 
 The repository now includes scripts for all seven phases.
 
+## Rust CLI (new)
+
+A beginner-focused Rust CLI now lives in `rem-cli/`.
+
+It is designed for:
+
+- basic HTML/CSS coding help
+- beginner-safe terminal command guidance
+- patch preview workflows with file context
+
+Build and run:
+
+```bash
+cd rem-cli
+cargo build
+cargo run -- ask "create a basic html page with linked css"
+```
+
+See `rem-cli/README.md` for full usage and safety model.
+
 ## Current Project Layout
 
 ```
@@ -115,6 +135,14 @@ Force regeneration:
 python3 scripts/prepare_data.py --config config/config.yaml --force
 ```
 
+Generate beginner web + terminal synthetic dataset:
+
+```bash
+python3 -m remllm.cli data generate \
+  --domain beginner \
+  --output data/domains/beginner/raw.generated.jsonl
+```
+
 ### 2) Baseline Evaluation
 
 ```bash
@@ -127,6 +155,11 @@ python3 scripts/evaluate_exec.py \
   --config config/config.yaml \
   --model deepseek-coder:1.3b \
   --report models/evals/baseline_exec.json
+
+python3 -m remllm.cli eval beginner \
+  --config config/domains/beginner_web_cli.yaml \
+  --model deepseek-coder:1.3b \
+  --report models/evals/beginner_baseline.json
 ```
 
 ### 3) Train (Unsloth)

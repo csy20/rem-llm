@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use regex::Regex;
 use reqwest::Client;
 use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use futures_util::StreamExt;
 use walkdir::WalkDir;
 
 // ── ANSI styling ───────────────────────────────────────────────────────────
@@ -41,6 +43,23 @@ Rules:
 - If a command could be dangerous, flag it in the caution field.
 - Keep explanations short and clear.
 - Prefer complete, runnable examples.
+"#;
+
+const CHAT_SYSTEM_PROMPT: &str = r#"You are REM, a friendly and helpful coding assistant.
+You speak conversationally and help beginners with:
+
+- HTML and CSS for building web pages
+- Safe terminal commands (never sudo, rm -rf, or dangerous pipes)
+- General programming questions
+
+You can search the web. When you need current information, tell the user to type /search <query> and you'll incorporate the results.
+
+Guidelines:
+- Be conversational — use markdown for formatting, code fences for code blocks.
+- For code generation, always ask for the file path first.
+- When the user wants a website, write complete, runnable HTML+CSS (and JS if needed).
+- If you're unsure about something, let the user know and suggest a web search.
+- Keep responses helpful but concise.
 "#;
 
 const BLOCKED_COMMAND_PATTERNS: [&str; 10] = [
@@ -290,6 +309,135 @@ impl OllamaClient {
             Err(_) => Ok(ModelReply::fallback(raw.response.trim())),
         }
     }
+
+    async fn complete_chat_stream(&self, user_prompt: &str, system_prompt: &str) -> Result<String> {
+        let url = api_url(&self.base_url, "generate");
+        let final_prompt = format!("{}\n\nUser: {}\n\nREM:", system_prompt, user_prompt);
+        let payload = json!({
+            "model": self.model,
+            "prompt": final_prompt,
+            "stream": true
+        });
+        let resp = self.client.post(&url).json(&payload).send().await
+            .context("failed to call Ollama")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let err_msg = serde_json::from_str::<OllamaErrorResponse>(&body)
+                .map(|v| v.error).unwrap_or_else(|_| body.clone());
+            if status.as_u16() == 404 && err_msg.to_lowercase().contains("model") {
+                return Err(anyhow!("Model '{}' not found. Pull it: `ollama pull {}`", self.model, self.model));
+            }
+            return Err(anyhow!("Ollama failed: {} — {}", status, err_msg));
+        }
+        let mut stream = resp.bytes_stream();
+        let mut full = String::new();
+        let mut buf = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("stream read error")?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].to_string();
+                buf = buf[pos + 1..].to_string();
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if let Some(token) = obj["response"].as_str() {
+                        print!("{}", token);
+                        let _ = io::stdout().flush();
+                        full.push_str(token);
+                    }
+                    if obj["done"].as_bool() == Some(true) {
+                        println!();
+                        return Ok(full);
+                    }
+                }
+            }
+        }
+        println!();
+        Ok(full)
+    }
+}
+
+// ── Web search ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct SearchResult {
+    title: String,
+    snippet: String,
+    url: String,
+}
+
+async fn perform_web_search(client: &Client, query: &str) -> Result<Vec<SearchResult>> {
+    let resp = client
+        .get("https://html.duckduckgo.com/html/")
+        .query(&[("q", query)])
+        .header("User-Agent", "rem-cli/0.1")
+        .send()
+        .await
+        .context("web search request failed")?;
+    let html = resp.text().await.context("failed to read search response")?;
+    Ok(parse_ddg_html(&html))
+}
+
+fn parse_ddg_html(html: &str) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let title_re = Regex::new(r#"class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*)</a>"#).unwrap();
+    let snippet_re = Regex::new(r#"class="result__snippet"[^>]*>([^<]*(?:<[^/>][^>]*>[^<]*</[^>]+>)*[^<]*)</a>"#).unwrap();
+    let mut remaining = html;
+    while results.len() < 8 {
+        if let Some(cap) = title_re.captures(remaining) {
+            let url = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let title = cap.get(2).map(|m| strip_html(m.as_str())).unwrap_or_default();
+            let snippet_pos = cap.get(0).map(|m| m.end()).unwrap_or(0);
+            let after_title = &remaining[snippet_pos..];
+            let snippet = snippet_re.captures(after_title)
+                .and_then(|c| c.get(1))
+                .map(|m| strip_html(m.as_str()).trim().to_string())
+                .unwrap_or_default();
+            if !title.is_empty() {
+                results.push(SearchResult { title, snippet, url });
+            }
+            let advance = cap.get(0).map(|m| m.end()).unwrap_or(1);
+            if advance >= remaining.len() { break; }
+            remaining = &remaining[advance..];
+        } else {
+            break;
+        }
+    }
+    results
+}
+
+fn strip_html(input: &str) -> String {
+    let tag_re = Regex::new(r"<[^>]*>").unwrap();
+    let amp_re = Regex::new(r"&amp;").unwrap();
+    let lt_re = Regex::new(r"&lt;").unwrap();
+    let gt_re = Regex::new(r"&gt;").unwrap();
+    let quot_re = Regex::new(r"&quot;").unwrap();
+    let apos_re = Regex::new(r"&#x27;").unwrap();
+    let mut s = tag_re.replace_all(input, "").to_string();
+    s = amp_re.replace_all(&s, "&").to_string();
+    s = lt_re.replace_all(&s, "<").to_string();
+    s = gt_re.replace_all(&s, ">").to_string();
+    s = quot_re.replace_all(&s, "\"").to_string();
+    s = apos_re.replace_all(&s, "'").to_string();
+    s.trim().to_string()
+}
+
+fn print_search_results(results: &[SearchResult]) {
+    if results.is_empty() {
+        println!("{}", style!(C_YELLOW, "  no results found"));
+        return;
+    }
+    println!("{}", style!(C_DIM, "│"));
+    for (i, r) in results.iter().enumerate() {
+        println!("{} {}", style!(C_CYAN, "│"), style!(C_WHITE_B, "{}. {}", i + 1, r.title));
+        println!("{}   {}", style!(C_CYAN, "│"), style!(C_DIM, "{}", r.url));
+        if !r.snippet.is_empty() {
+            println!("{}   {}", style!(C_CYAN, "│"), r.snippet);
+        }
+        println!("{}", style!(C_CYAN, "│"));
+    }
 }
 
 // ── Chat session state ─────────────────────────────────────────────────────
@@ -297,13 +445,14 @@ impl OllamaClient {
 struct ChatSession {
     rl: DefaultEditor,
     last_code: String,
+    last_search: Vec<SearchResult>,
     project_dir: Option<PathBuf>,
 }
 
 impl ChatSession {
     fn new() -> Result<Self> {
         let rl = DefaultEditor::new().context("failed to start line editor")?;
-        Ok(Self { rl, last_code: String::new(), project_dir: None })
+        Ok(Self { rl, last_code: String::new(), last_search: Vec::new(), project_dir: None })
     }
 
     fn readline(&mut self, prompt: &str) -> io::Result<String> {
@@ -312,6 +461,17 @@ impl ChatSession {
 
     fn add_history(&mut self, line: &str) {
         let _ = self.rl.add_history_entry(line);
+    }
+
+    fn build_search_context(&self) -> String {
+        if self.last_search.is_empty() {
+            return String::new();
+        }
+        let mut ctx = String::from("\n\n[Web search results — use these when answering]:\n");
+        for (i, r) in self.last_search.iter().enumerate() {
+            ctx.push_str(&format!("{}. {}\n   URL: {}\n   {}\n\n", i + 1, r.title, r.url, r.snippet));
+        }
+        ctx
     }
 }
 
@@ -461,6 +621,11 @@ async fn run_chat(client: &OllamaClient) -> Result<()> {
             continue;
         }
 
+        if let Some(tail) = trimmed.strip_prefix("/search ") {
+            handle_search(client, &mut session, tail.trim()).await;
+            continue;
+        }
+
         if let Some(_) = trimmed.strip_prefix("/code") {
             if session.last_code.is_empty() {
                 println!("  {} No code from last response.", style!(C_YELLOW, "!"));
@@ -487,16 +652,21 @@ async fn run_chat(client: &OllamaClient) -> Result<()> {
             }
         };
 
-        // ── call model ──────────────────────────────────────────────
-        print_status("Thinking...");
-        match client.complete_json(&final_prompt).await {
-            Ok(reply) => {
-                if !reply.code.trim().is_empty() {
-                    session.last_code = reply.code.clone();
+        // ── call model (streaming) ─────────────────────────────────
+        let search_ctx = session.build_search_context();
+        let full_prompt = if search_ctx.is_empty() { final_prompt } else { format!("{}{}", final_prompt, search_ctx) };
+        print!("{} ", style!(C_CYAN, "│"));
+        println!("{}", style!(C_DIM, "── rem ──"));
+        match client.complete_chat_stream(&full_prompt, CHAT_SYSTEM_PROMPT).await {
+            Ok(text) => {
+                let code = extract_code_block(&text);
+                if !code.is_empty() {
+                    session.last_code = code;
                 }
-                print_reply(&reply, true);
+                println!("{}", style!(C_DIM, "│"));
             }
             Err(e) => {
+                println!();
                 eprintln!("  {} {}", style!(C_RED, "err:"), e);
             }
         }
@@ -578,6 +748,24 @@ fn handle_dir(session: &mut ChatSession, path: &str) {
     }
 }
 
+async fn handle_search(client: &OllamaClient, session: &mut ChatSession, query: &str) {
+    println!("{} {} searching the web...", style!(C_DIM, "│"), style!(C_CYAN, "🔍"));
+    match perform_web_search(&client.client, query).await {
+        Ok(results) => {
+            if results.is_empty() {
+                println!("{} no results found for: {}", style!(C_YELLOW, "│"), query);
+            } else {
+                println!("{} {} results for: {}", style!(C_DIM, "│"), results.len(), style!(C_WHITE_B, "{}", query));
+                print_search_results(&results);
+                session.last_search = results;
+            }
+        }
+        Err(e) => {
+            println!("{} {}", style!(C_RED, "│  search failed:"), e);
+        }
+    }
+}
+
 fn print_chat_help() {
     println!("{}", style!(C_DIM, "│"));
     println!("{} {}", style!(C_DIM, "│"), style!(C_WHITE_B, "commands:"));
@@ -585,6 +773,7 @@ fn print_chat_help() {
     println!("{}   /write <path>   save last code to file", style!(C_DIM, "│"));
     println!("{}   /save <path>    same as /write", style!(C_DIM, "│"));
     println!("{}   /dir <path>     set project root directory", style!(C_DIM, "│"));
+    println!("{}   /search <q>     search the web", style!(C_DIM, "│"));
     println!("{}   /code           show last generated code", style!(C_DIM, "│"));
     println!("{}   exit            quit REM", style!(C_DIM, "│"));
     println!("{}", style!(C_DIM, "│"));

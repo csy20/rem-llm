@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -23,6 +25,7 @@ const C_GREEN: &str = "\x1b[32m";
 const C_YELLOW: &str = "\x1b[33m";
 const C_RED: &str = "\x1b[31m";
 const C_MAGENTA: &str = "\x1b[35m";
+const C_BLUE: &str = "\x1b[34m";
 const C_WHITE_B: &str = "\x1b[1;37m";
 
 macro_rules! style {
@@ -33,34 +36,55 @@ macro_rules! style {
 
 // ── Config & Prompts ───────────────────────────────────────────────────────
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are REM, a beginner-friendly coding assistant.
-Focus on HTML, CSS, and safe terminal basics.
+const DEFAULT_SYSTEM_PROMPT: &str = r##"You are REM, a beginner-friendly coding assistant.
+Focus on HTML, CSS, JS, and safe terminal basics.
 
 Rules:
-- Always return strict JSON with keys: explanation, code, commands, checks, caution.
-- Before generating code, ALWAYS ask the user for the file path where the code should be saved. Include this in your explanation.
+- Always return strict JSON with keys: explanation, code, files, commands, checks, caution.
+- The "files" array allows you to return MULTIPLE files in one response. Each entry has "path" (relative filepath) and "content" (full file content). Use this whenever the user wants more than one file (e.g. index.html + style.css + script.js). When only one file is needed, you may still use "files" or put the content in "code".
+- "code" is a single code block (legacy). Prefer "files" for multi-file output.
 - commands must be safe for beginners — never suggest sudo, rm -rf, or pipes to bash.
 - If a command could be dangerous, flag it in the caution field.
 - Keep explanations short and clear.
 - Prefer complete, runnable examples.
-"#;
+"##;
 
-const CHAT_SYSTEM_PROMPT: &str = r#"You are REM, a friendly and helpful coding assistant.
+const CHAT_SYSTEM_PROMPT: &str = r##"You are REM, a friendly and helpful coding assistant.
 You speak conversationally and help beginners with:
 
 - HTML and CSS for building web pages
+- JavaScript for interactivity
 - Safe terminal commands (never sudo, rm -rf, or dangerous pipes)
 - General programming questions
 
 You can search the web. When you need current information, tell the user to type /search <query> and you'll incorporate the results.
 
+IMPORTANT — Multi-file format:
+When the user asks for a website or project that needs multiple files, output them using this format:
+
+### path/to/file.html
+```html
+<file content here>
+```
+
+### path/to/file.css
+```css
+<file content here>
+```
+
+### path/to/script.js
+```js
+<file content here>
+```
+
+Each file MUST have its own heading (three hashes) with the file path, then a code fence. This lets the CLI auto-save all files at once. Always provide complete, runnable code.
+
 Guidelines:
 - Be conversational — use markdown for formatting, code fences for code blocks.
-- For code generation, always ask for the file path first.
 - When the user wants a website, write complete, runnable HTML+CSS (and JS if needed).
 - If you're unsure about something, let the user know and suggest a web search.
 - Keep responses helpful but concise.
-"#;
+"##;
 
 const BLOCKED_COMMAND_PATTERNS: [&str; 10] = [
     "rm -rf /", "rm -rf", "rm  -rf", "mkfs", "dd if=",
@@ -81,6 +105,8 @@ struct Cli {
     model: Option<String>,
     #[arg(long, global = true, help = "Ollama API URL")]
     ollama_url: Option<String>,
+    #[arg(long, short = 'v', global = true, help = "Verbose output (show raw model responses)")]
+    verbose: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -95,6 +121,8 @@ enum Commands {
     Patch(PatchArgs),
     #[command(about = "Start an interactive chat session")]
     Chat,
+    #[command(about = "Scaffold a new project with templates")]
+    New(NewArgs),
 }
 
 #[derive(Args, Debug)]
@@ -117,6 +145,14 @@ struct PatchArgs {
     file: PathBuf,
     #[arg(long, help = "Description of changes needed")]
     task: String,
+}
+
+#[derive(Args, Debug)]
+struct NewArgs {
+    #[arg(help = "Project name / directory path")]
+    name: String,
+    #[arg(long, default_value = "bare", help = "Project type: bare, portfolio, landing, blog")]
+    project_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,12 +197,25 @@ impl AppConfig {
 
 // ── Model reply schema ─────────────────────────────────────────────────────
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct FileEntry {
+    path: String,
+    content: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelReply {
+    #[serde(default)]
     explanation: String,
+    #[serde(default)]
     code: String,
+    #[serde(default)]
+    files: Vec<FileEntry>,
+    #[serde(default)]
     commands: Vec<String>,
+    #[serde(default)]
     checks: Vec<String>,
+    #[serde(default)]
     caution: String,
 }
 
@@ -181,14 +230,18 @@ impl ModelReply {
                 commands.push(trimmed.to_string());
             }
         }
+        let files = extract_code_blocks_with_names(raw_text);
+        let single_code = extract_code_block(raw_text);
         Self {
             explanation: raw_text.trim().to_string(),
-            code: extract_code_block(raw_text),
+            code: single_code,
+            files,
             commands,
             checks: vec!["Verify each step before running.".to_string()],
             caution: "Model returned non-JSON output. Review everything carefully.".to_string(),
         }
     }
+
 }
 
 fn extract_code_block(text: &str) -> String {
@@ -210,6 +263,100 @@ fn extract_code_block(text: &str) -> String {
         }
     }
     if code_lines.is_empty() { String::new() } else { code_lines.join("\n") }
+}
+
+fn extract_code_blocks_with_names(text: &str) -> Vec<FileEntry> {
+    let mut files = Vec::new();
+    let mut current_name = String::new();
+    let mut in_fence = false;
+    let mut code_lines: Vec<&str> = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("```") {
+            if in_fence {
+                let content = code_lines.join("\n");
+                if !content.trim().is_empty() {
+                    let path = if current_name.is_empty() {
+                        guess_filename(&code_lines)
+                    } else {
+                        current_name.clone()
+                    };
+                    files.push(FileEntry { path, content });
+                }
+                code_lines.clear();
+                current_name.clear();
+                in_fence = false;
+            } else {
+                in_fence = true;
+            }
+            continue;
+        }
+
+        if in_fence {
+            code_lines.push(line);
+            continue;
+        }
+
+        if let Some(name) = trimmed.strip_prefix("### ").or_else(|| trimmed.strip_prefix("## ")) {
+            current_name = name.trim().to_lowercase();
+            continue;
+        }
+
+        if let Some(name) = current_name_from_bold(trimmed) {
+            current_name = name;
+            continue;
+        }
+    }
+
+    if in_fence && !code_lines.is_empty() {
+        let content = code_lines.join("\n");
+        if !content.trim().is_empty() {
+            let path = if current_name.is_empty() {
+                guess_filename(&code_lines)
+            } else {
+                current_name.clone()
+            };
+            files.push(FileEntry { path, content });
+        }
+    }
+
+    files
+}
+
+fn current_name_from_bold(line: &str) -> Option<String> {
+    let re = Regex::new(r"\*\*(.+?)\*\*").ok()?;
+    if let Some(cap) = re.captures(line) {
+        let name = cap.get(1)?.as_str().trim().to_lowercase();
+        if name.contains('.') {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn guess_filename(lines: &[&str]) -> String {
+    for line in lines.iter().take(3) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("<!DOCTYPE") || trimmed.starts_with("<html") || trimmed.contains("<head") {
+            return "index.html".to_string();
+        }
+        if trimmed.starts_with("body ") || trimmed.starts_with(".") || trimmed.starts_with("#")
+            || trimmed.starts_with("@media") || trimmed.starts_with(":root")
+            || trimmed.contains("{") && trimmed.contains("}") && !trimmed.contains("function")
+        {
+            return "style.css".to_string();
+        }
+        if trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("var ")
+            || trimmed.starts_with("function ") || trimmed.starts_with("document.")
+            || trimmed.starts_with("import ") || trimmed.starts_with("export ")
+            || trimmed.starts_with("fetch(") || trimmed.starts_with("addEventListener")
+        {
+            return "script.js".to_string();
+        }
+    }
+    String::new()
 }
 
 // ── Ollama client ──────────────────────────────────────────────────────────
@@ -281,6 +428,17 @@ impl OllamaClient {
                 "properties": {
                     "explanation": {"type": "string"},
                     "code": {"type": "string"},
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"}
+                            },
+                            "required": ["path", "content"]
+                        }
+                    },
                     "commands": {"type": "array", "items": {"type": "string"}},
                     "checks": {"type": "array", "items": {"type": "string"}},
                     "caution": {"type": "string"}
@@ -288,8 +446,10 @@ impl OllamaClient {
                 "required": ["explanation", "code", "commands", "checks", "caution"]
             }
         });
+
         let resp = self.client.post(&url).json(&payload).send().await
             .context("failed to call Ollama")?;
+
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -303,16 +463,29 @@ impl OllamaClient {
             }
             return Err(anyhow!("Ollama failed: {} — {}", status, err_msg));
         }
+
         let raw: OllamaResponse = resp.json().await.context("invalid Ollama response")?;
         match serde_json::from_str::<ModelReply>(raw.response.trim()) {
             Ok(parsed) => Ok(parsed),
-            Err(_) => Ok(ModelReply::fallback(raw.response.trim())),
+            Err(e) => {
+                eprintln!("  {} JSON parse: {} — falling back", style!(C_YELLOW, "!"), e);
+                Ok(ModelReply::fallback(raw.response.trim()))
+            }
         }
     }
 
-    async fn complete_chat_stream(&self, user_prompt: &str, system_prompt: &str) -> Result<String> {
+    async fn complete_chat_stream(
+        &self,
+        user_prompt: &str,
+        system_prompt: &str,
+        history: &str,
+    ) -> Result<String> {
         let url = api_url(&self.base_url, "generate");
-        let final_prompt = format!("{}\n\nUser: {}\n\nREM:", system_prompt, user_prompt);
+        let final_prompt = if history.is_empty() {
+            format!("{}\n\nUser: {}\n\nREM:", system_prompt, user_prompt)
+        } else {
+            format!("{}\n\n{}User: {}\n\nREM:", system_prompt, history, user_prompt)
+        };
         let payload = json!({
             "model": self.model,
             "prompt": final_prompt,
@@ -372,7 +545,7 @@ async fn perform_web_search(client: &Client, query: &str) -> Result<Vec<SearchRe
     let resp = client
         .get("https://html.duckduckgo.com/html/")
         .query(&[("q", query)])
-        .header("User-Agent", "rem-cli/0.1")
+        .header("User-Agent", "rem-cli/0.2")
         .send()
         .await
         .context("web search request failed")?;
@@ -445,14 +618,25 @@ fn print_search_results(results: &[SearchResult]) {
 struct ChatSession {
     rl: DefaultEditor,
     last_code: String,
+    last_files: Vec<FileEntry>,
+    last_files_written: Vec<PathBuf>,
     last_search: Vec<SearchResult>,
     project_dir: Option<PathBuf>,
+    history: Vec<(String, String)>,
 }
 
 impl ChatSession {
     fn new() -> Result<Self> {
         let rl = DefaultEditor::new().context("failed to start line editor")?;
-        Ok(Self { rl, last_code: String::new(), last_search: Vec::new(), project_dir: None })
+        Ok(Self {
+            rl,
+            last_code: String::new(),
+            last_files: Vec::new(),
+            last_files_written: Vec::new(),
+            last_search: Vec::new(),
+            project_dir: None,
+            history: Vec::new(),
+        })
     }
 
     fn readline(&mut self, prompt: &str) -> io::Result<String> {
@@ -473,6 +657,52 @@ impl ChatSession {
         }
         ctx
     }
+
+    fn build_chat_history(&self) -> String {
+        if self.history.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("[Previous conversation — keep context in mind]:\n\n");
+        for (user, assistant) in self.history.iter().rev().take(6).rev() {
+            let truncated_assistant = truncate_to_lines(assistant, 15);
+            out.push_str(&format!("User: {}\nREM: {}\n\n", user, truncated_assistant));
+        }
+        out
+    }
+}
+
+fn truncate_to_lines(s: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = s.lines().take(max_lines).collect();
+    let mut result = lines.join("\n");
+    if s.lines().count() > max_lines {
+        result.push_str("\n...[truncated]");
+    }
+    result
+}
+
+// ── Spinner ────────────────────────────────────────────────────────────────
+
+fn spawn_spinner(msg: &'static str) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    let handle = tokio::spawn(async move {
+        let chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut i = 0;
+        while r.load(Ordering::Relaxed) {
+            eprint!("\r  {} {}", style!(C_CYAN, "{}", chars[i]), style!(C_DIM, "{}", msg));
+            let _ = io::stderr().flush();
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            i = (i + 1) % chars.len();
+        }
+    });
+    (running, handle)
+}
+
+async fn clear_spinner(running: Arc<AtomicBool>, handle: tokio::task::JoinHandle<()>) {
+    running.store(false, Ordering::Relaxed);
+    let _ = handle.await;
+    eprint!("\r{}\r", " ".repeat(60));
+    let _ = io::stderr().flush();
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -480,6 +710,15 @@ impl ChatSession {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let verbose = cli.verbose;
+
+    match cli.command {
+        Commands::New(args) => {
+            return run_new(args);
+        }
+        _ => {}
+    }
+
     let mut cfg = load_config().unwrap_or_default();
     if let Some(m) = cli.model { cfg.model = m; }
     if let Some(url) = cli.ollama_url { cfg.ollama_url = url; }
@@ -497,10 +736,11 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Ask(args)    => run_ask(&client, &cfg, args).await,
+        Commands::Ask(args)    => run_ask(&client, &cfg, args, verbose).await,
         Commands::Explain(args) => run_explain(&client, args).await,
         Commands::Patch(args)   => run_patch(&client, &cfg, args).await,
-        Commands::Chat          => run_chat(&client).await,
+        Commands::Chat          => run_chat(&client, verbose).await,
+        Commands::New(_)        => unreachable!(),
     }
 }
 
@@ -544,15 +784,22 @@ fn load_system_prompt(custom_prompts_dir: Option<&str>) -> String {
 
 // ── Subcommand handlers ────────────────────────────────────────────────────
 
-async fn run_ask(client: &OllamaClient, cfg: &AppConfig, args: AskArgs) -> Result<()> {
+async fn run_ask(client: &OllamaClient, cfg: &AppConfig, args: AskArgs, verbose: bool) -> Result<()> {
     let mut composed = args.prompt;
     if let Some(path) = args.file {
         let ctx = build_context(&path, cfg.max_context_bytes)?;
         composed = format!("{}\n\nFile context:\n{}", composed, ctx);
     }
     print_banner(client);
-    print_status("Thinking...");
-    let reply = client.complete_json(&composed).await?;
+
+    let (spin_flag, spin_handle) = spawn_spinner("thinking...");
+    let reply = client.complete_json(&composed).await;
+    clear_spinner(spin_flag, spin_handle).await;
+
+    let reply = reply?;
+    if verbose {
+        eprintln!("{} raw files: {:?}", style!(C_DIM, "verbose:"), reply.files);
+    }
     print_reply(&reply, true);
     Ok(())
 }
@@ -560,7 +807,12 @@ async fn run_ask(client: &OllamaClient, cfg: &AppConfig, args: AskArgs) -> Resul
 async fn run_explain(client: &OllamaClient, args: ExplainArgs) -> Result<()> {
     print_banner(client);
     let prompt = format!("Explain this terminal command for a beginner and suggest a safer variant if needed: {}", args.command);
-    let reply = client.complete_json(&prompt).await?;
+
+    let (spin_flag, spin_handle) = spawn_spinner("thinking...");
+    let reply = client.complete_json(&prompt).await;
+    clear_spinner(spin_flag, spin_handle).await;
+
+    let reply = reply?;
     print_reply(&reply, true);
     Ok(())
 }
@@ -571,10 +823,15 @@ async fn run_patch(client: &OllamaClient, cfg: &AppConfig, args: PatchArgs) -> R
         .with_context(|| format!("failed to read {}", args.file.display()))?;
     let dir_ctx = build_context(&args.file, cfg.max_context_bytes)?;
     let prompt = format!(
-        "Task: {}\n\nTarget file: {}\n\nCurrent content:\n{}\n\nNearby context:\n{}\n\nReturn updated file content in code.",
+        "Task: {}\n\nTarget file: {}\n\nCurrent content:\n{}\n\nNearby context:\n{}\n\nReturn updated file content in code or files array.",
         args.task, args.file.display(), existing, dir_ctx
     );
-    let reply = client.complete_json(&prompt).await?;
+
+    let (spin_flag, spin_handle) = spawn_spinner("thinking...");
+    let reply = client.complete_json(&prompt).await;
+    clear_spinner(spin_flag, spin_handle).await;
+
+    let reply = reply?;
     println!("{}", style!(C_CYAN, "Patch preview for {}", args.file.display()));
     print_reply(&reply, true);
     Ok(())
@@ -582,13 +839,57 @@ async fn run_patch(client: &OllamaClient, cfg: &AppConfig, args: PatchArgs) -> R
 
 // ── Interactive chat ───────────────────────────────────────────────────────
 
-async fn run_chat(client: &OllamaClient) -> Result<()> {
+fn print_welcome(client: &OllamaClient) {
+    let model_short = client.model.split(':').next().unwrap_or(&client.model);
+    println!();
+    println!("{}",
+        style!(C_CYAN, "\u{2554}\u{2550}\u{2564}\u{2550}\u{2564}\u{2550}\u{2564}\u{2550}\u{2564}\u{2550}\u{2557}"));
+    println!("{} {} {} {} {} {} {}",
+        style!(C_CYAN, "\u{2551}"),
+        style!(C_BOLD, "REM v{}", env!("CARGO_PKG_VERSION")),
+        style!(C_CYAN, "\u{2502}"),
+        style!(C_DIM, "model: {}", model_short),
+        style!(C_CYAN, "\u{2502}"),
+        style!(C_GREEN, "\u{26a1} /help for commands"),
+        style!(C_CYAN, "\u{2551}"));
+    println!("{}",
+        style!(C_CYAN, "\u{255a}\u{2550}\u{2567}\u{2550}\u{2567}\u{2550}\u{2567}\u{2550}\u{2567}\u{2550}\u{255d}"));
+    println!();
+}
+
+fn build_prompt(session: &ChatSession, client: &OllamaClient) -> String {
+    let model_short = client.model.split(':').next().unwrap_or(&client.model);
+    let mut p = String::new();
+    p.push_str("\x01");
+    p.push_str(C_GREEN);
+    p.push_str("\x02");
+    p.push_str(model_short);
+    p.push_str("\x01\x1b[0m\x02");
+    if let Some(ref d) = session.project_dir {
+        p.push(' ');
+        p.push_str("\x01");
+        p.push_str(C_DIM);
+        p.push_str("\x02");
+        p.push_str(&d.display().to_string());
+        p.push_str("\x01\x1b[0m\x02");
+    }
+    p.push(' ');
+    p.push_str("\x01");
+    p.push_str(C_CYAN);
+    p.push_str("\x02");
+    p.push('\u{203a}');
+    p.push_str("\x01\x1b[0m\x02");
+    p.push(' ');
+    p
+}
+
+async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
     let mut session = ChatSession::new()?;
-    print_banner(client);
-    print_chat_help();
+    print_welcome(client);
 
     loop {
-        let line = session.readline("rem> ");
+        let prompt = build_prompt(&session, client);
+        let line = session.readline(&prompt);
         let line = match line {
             Ok(s) => s,
             Err(_) => break,
@@ -596,7 +897,6 @@ async fn run_chat(client: &OllamaClient) -> Result<()> {
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
 
-        // ── built-in commands ──────────────────────────────────────
         if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
             println!("  {}", style!(C_DIM, "bye!"));
             break;
@@ -626,18 +926,21 @@ async fn run_chat(client: &OllamaClient) -> Result<()> {
             continue;
         }
 
-        if let Some(_) = trimmed.strip_prefix("/code") {
-            if session.last_code.is_empty() {
-                println!("  {} No code from last response.", style!(C_YELLOW, "!"));
-            } else {
-                println!("{}", style!(C_WHITE_B, "── last code ──"));
-                println!("{}", session.last_code);
-                println!("{}", style!(C_DIM, "───────────────"));
-            }
+        if trimmed.eq_ignore_ascii_case("/code") {
+            print_last_files(&session);
             continue;
         }
 
-        // ── detect creation intent without a path ───────────────────
+        if trimmed.eq_ignore_ascii_case("/undo") {
+            handle_undo(&mut session);
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("/files") {
+            handle_list_files(&session);
+            continue;
+        }
+
         let needs_path = has_creation_intent(trimmed) && !has_file_path(trimmed);
         let final_prompt = if needs_path {
             session.add_history(trimmed);
@@ -646,23 +949,79 @@ async fn run_chat(client: &OllamaClient) -> Result<()> {
         } else {
             session.add_history(trimmed);
             if let Some(ref dir) = session.project_dir {
-                format!("{}\n\nWorking directory: {}", trimmed, dir.display())
+                format!("User request: {}\n\nWorking directory: {}", trimmed, dir.display())
             } else {
-                trimmed.to_string()
+                format!("User request: {}", trimmed)
             }
         };
 
-        // ── call model (streaming) ─────────────────────────────────
         let search_ctx = session.build_search_context();
-        let full_prompt = if search_ctx.is_empty() { final_prompt } else { format!("{}{}", final_prompt, search_ctx) };
-        print!("{} ", style!(C_CYAN, "│"));
-        println!("{}", style!(C_DIM, "── rem ──"));
-        match client.complete_chat_stream(&full_prompt, CHAT_SYSTEM_PROMPT).await {
+        let history_ctx = session.build_chat_history();
+        let full_prompt = {
+            let mut p = final_prompt;
+            if !search_ctx.is_empty() {
+                p.push_str(&search_ctx);
+            }
+            p
+        };
+
+        print!("{} ", style!(C_CYAN, "\u{2502}"));
+        println!("{}", style!(C_DIM, "\u{2500}\u{2500} rem \u{2500}\u{2500}"));
+
+        let start = std::time::Instant::now();
+        let (spin_flag, spin_handle) = spawn_spinner("REM is writing...");
+        let result = client.complete_chat_stream(&full_prompt, CHAT_SYSTEM_PROMPT, &history_ctx).await;
+        clear_spinner(spin_flag, spin_handle).await;
+        let elapsed = start.elapsed();
+
+        match result {
             Ok(text) => {
-                let code = extract_code_block(&text);
-                if !code.is_empty() {
-                    session.last_code = code;
+                if verbose {
+                    eprintln!("\n  {} raw response:\n{}\n", style!(C_DIM, "verbose:"), text);
                 }
+
+                println!("{} {}",
+                    style!(C_CYAN, "\u{2502}"),
+                    style!(C_DIM, "\u{23f1} {:.1}s", elapsed.as_secs_f64()));
+
+                let code = extract_code_block(&text);
+                let files = extract_code_blocks_with_names(&text);
+
+                if !files.is_empty() {
+                    session.last_files = files.clone();
+                    if !code.is_empty() {
+                        session.last_code = code;
+                    }
+                    println!("{}", style!(C_CYAN, "│"));
+                    println!("{} {} {}",
+                        style!(C_CYAN, "│"),
+                        style!(C_GREEN, "generated:"),
+                        style!(C_WHITE_B, "{} file(s)", files.len()));
+                    for f in &files {
+                        let icon = file_icon(&f.path);
+                        if f.path.is_empty() {
+                            println!("{}   {} unnamed ({} bytes)", style!(C_CYAN, "│"), icon, f.content.len());
+                        } else {
+                            println!("{}   {} {} ({} bytes)",
+                                style!(C_CYAN, "│"), icon,
+                                style!(C_WHITE_B, "{}", f.path), f.content.len());
+                        }
+                    }
+                    println!("{}", style!(C_CYAN, "│"));
+
+                    auto_write_files(&mut session, &files);
+                } else if !code.is_empty() {
+                    session.last_code = code;
+                    session.last_files.clear();
+                }
+
+                if !text.trim().is_empty() {
+                    session.history.push((trimmed.to_string(), text));
+                    if session.history.len() > 12 {
+                        session.history.remove(0);
+                    }
+                }
+
                 println!("{}", style!(C_DIM, "│"));
             }
             Err(e) => {
@@ -674,14 +1033,12 @@ async fn run_chat(client: &OllamaClient) -> Result<()> {
     Ok(())
 }
 
-/// Returns true if the user prompt looks like they want to create/build something.
 fn has_creation_intent(input: &str) -> bool {
     let lower = input.to_lowercase();
     let creation_words = ["create", "build", "make", "generate", "write", "scaffold", "set up"];
     creation_words.iter().any(|w| lower.contains(w))
 }
 
-/// Returns true if the prompt mentions a file path or directory.
 fn has_file_path(input: &str) -> bool {
     let lower = input.to_lowercase();
     lower.contains(".html") || lower.contains(".css") || lower.contains(".js")
@@ -690,7 +1047,6 @@ fn has_file_path(input: &str) -> bool {
         || lower.contains("into ") || lower.contains("in ")
 }
 
-/// When no file path is in the user's request, ask them where to save.
 fn prompt_for_path(session: &mut ChatSession) -> io::Result<String> {
     println!("{}", style!(C_CYAN, "│"));
     println!("{} {}",
@@ -720,20 +1076,293 @@ fn prompt_for_path(session: &mut ChatSession) -> io::Result<String> {
 }
 
 fn handle_write(session: &ChatSession, path: &str) {
+    let file_path = PathBuf::from(path.trim());
+    let abs_path = if file_path.is_relative() {
+        if let Some(ref dir) = session.project_dir {
+            dir.join(&file_path)
+        } else {
+            std::env::current_dir().unwrap_or_default().join(&file_path)
+        }
+    } else {
+        file_path
+    };
+
     if session.last_code.is_empty() {
         println!("  {} No code from last response. Use `/code` to view it.", style!(C_YELLOW, "!"));
         return;
     }
-    let file_path = PathBuf::from(path.trim());
-    if let Some(parent) = file_path.parent() {
+    if let Some(parent) = abs_path.parent() {
         if !parent.as_os_str().is_empty() {
             let _ = fs::create_dir_all(parent);
         }
     }
-    match fs::write(&file_path, &session.last_code) {
+    match fs::write(&abs_path, &session.last_code) {
         Ok(()) => println!("  {} wrote {} ({} bytes)",
-            style!(C_GREEN, "✓"), style!(C_WHITE_B, "{}", file_path.display()), session.last_code.len()),
+            style!(C_GREEN, "✓"), style!(C_WHITE_B, "{}", abs_path.display()), session.last_code.len()),
         Err(e) => println!("  {} failed: {}", style!(C_RED, "✗"), e),
+    }
+}
+
+fn auto_write_files(session: &mut ChatSession, files: &[FileEntry]) {
+    if files.is_empty() || files.iter().all(|f| f.path.is_empty()) {
+        println!("{} {} Type /write <path> to save.", style!(C_YELLOW, "│  !"), style!(C_DIM, ""));
+        return;
+    }
+
+    println!("{} {} {}",
+        style!(C_MAGENTA, "│  ?"),
+        style!(C_WHITE_B, "Write all {} files? [Y/n]", files.len()),
+        style!(C_DIM, "(press Enter to confirm)"));
+
+    let input = session.readline("rem> ").unwrap_or_else(|_| String::from("y"));
+    let input = input.trim();
+    if !input.is_empty() && !input.eq_ignore_ascii_case("y") && !input.eq_ignore_ascii_case("yes") {
+        println!("{} {}", style!(C_YELLOW, "│  !"), "skipped. Use /write <path> to save individually.");
+        return;
+    }
+
+    let base_dir = session.project_dir.clone().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_default()
+    });
+
+    let mut written: Vec<PathBuf> = Vec::new();
+    for f in files {
+        let rel_path = PathBuf::from(&f.path);
+        let abs_path = if rel_path.is_relative() {
+            base_dir.join(&rel_path)
+        } else {
+            rel_path
+        };
+
+        if let Some(parent) = abs_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+
+        match fs::write(&abs_path, &f.content) {
+            Ok(()) => {
+                println!("{}   {} {} ({} bytes)",
+                    style!(C_GREEN, "│ ✓"),
+                    style!(C_WHITE_B, "{}", f.path),
+                    style!(C_DIM, ""),
+                    f.content.len());
+                written.push(abs_path);
+            }
+            Err(e) => {
+                println!("{}   {} {}: {}", style!(C_RED, "│ ✗"), style!(C_WHITE_B, "{}", f.path), style!(C_DIM, ""), e);
+            }
+        }
+    }
+
+    if !written.is_empty() {
+        session.last_files_written = written;
+        println!("{} {} {} files written.",
+            style!(C_GREEN, "│ ✓"), style!(C_WHITE_B, "{}", session.last_files_written.len()), style!(C_DIM, ""));
+    }
+}
+
+fn handle_undo(session: &mut ChatSession) {
+    if session.last_files_written.is_empty() {
+        println!("  {} Nothing to undo.", style!(C_YELLOW, "!"));
+        return;
+    }
+    println!("{} {}",
+        style!(C_MAGENTA, "│  ?"),
+        style!(C_WHITE_B, "Delete the last {} written file(s)? [y/N]", session.last_files_written.len()));
+
+    let input = session.readline("rem> ").unwrap_or_else(|_| String::new());
+    let input = input.trim();
+    if !input.eq_ignore_ascii_case("y") && !input.eq_ignore_ascii_case("yes") {
+        println!("  {} cancelled", style!(C_DIM, "│"));
+        return;
+    }
+
+    let mut removed = 0;
+    for path in session.last_files_written.drain(..) {
+        if path.exists() {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    println!("  {} removed {}", style!(C_YELLOW, "│"), style!(C_DIM, "{}", path.display()));
+                    removed += 1;
+                }
+                Err(e) => {
+                    println!("  {} failed to remove {}: {}", style!(C_RED, "│"), path.display(), e);
+                }
+            }
+        }
+    }
+    if removed > 0 {
+        println!("  {} {} {} file(s) removed.", style!(C_GREEN, "│ ✓"), removed, style!(C_DIM, ""));
+    }
+}
+
+fn handle_list_files(session: &ChatSession) {
+    let dir = session.project_dir.as_ref().cloned().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_default()
+    });
+
+    println!("{}", style!(C_DIM, "\u{2502}"));
+    println!("{} {}", style!(C_DIM, "\u{2502}"), style!(C_WHITE_B, "\u{1f4c2} project ({})", dir.display()));
+    println!("{}", style!(C_DIM, "\u{2502}"));
+
+    let mut entries: Vec<(String, bool, u64)> = Vec::new();
+    for entry in WalkDir::new(&dir).max_depth(4).into_iter().filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p == dir { continue; }
+        if let Ok(rel) = p.strip_prefix(&dir) {
+            let size = if p.is_file() {
+                fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+            } else { 0 };
+            entries.push((rel.display().to_string(), p.is_dir(), size));
+        }
+    }
+    entries.sort();
+
+    if entries.is_empty() {
+        println!("{}   {}", style!(C_DIM, "\u{2502}"), style!(C_YELLOW, "(empty)"));
+    } else {
+        for (path, is_dir, size) in &entries {
+            let depth = path.chars().filter(|&c| c == '/').count();
+            let indent = "  ".repeat(depth);
+            let name = if let Some(pos) = path.rfind('/') {
+                &path[pos + 1..]
+            } else {
+                path
+            };
+            if *is_dir {
+                println!("{} {} {} {} {}",
+                    style!(C_DIM, "\u{2502}"), indent,
+                    style!(C_DIM, "\u{251c}\u{2500}\u{2500}"),
+                    style!(C_BLUE, "\u{1f4c1} {}/", name),
+                    style!(C_RESET, ""));
+            } else {
+                let icon = file_icon(name);
+                let hs = human_size(*size);
+                println!("{} {} {} {} {} {}",
+                    style!(C_DIM, "\u{2502}"), indent,
+                    style!(C_DIM, "\u{251c}\u{2500}\u{2500}"),
+                    icon,
+                    style!(C_WHITE_B, "{}", name),
+                    style!(C_DIM, "({})", hs));
+            }
+        }
+    }
+    println!("{}", style!(C_DIM, "\u{2502}"));
+}
+
+fn highlight_code(content: &str, lang_hint: &str) -> String {
+    let lang = lang_hint.to_lowercase();
+    if lang.contains("html") {
+        highlight_html(content)
+    } else if lang.contains("css") {
+        highlight_css(content)
+    } else if lang.contains("js") || lang.contains("javascript") || lang.contains("ts") || lang.contains("typescript") {
+        highlight_js(content)
+    } else {
+        highlight_generic(content)
+    }
+}
+
+fn highlight_html(code: &str) -> String {
+    let tag_re = Regex::new(r"(</?\w+[^>]*>)").unwrap();
+    let attr_re = Regex::new(r#"("[^"]*")"#).unwrap();
+    let comment_re = Regex::new(r"(<!--.*?-->)").unwrap();
+    let mut out = code.to_string();
+    out = comment_re.replace_all(&out, |caps: &regex::Captures| {
+        style!(C_DIM, "{}", &caps[1])
+    }).to_string();
+    out = tag_re.replace_all(&out, |caps: &regex::Captures| {
+        let tag = &caps[1];
+        let inner = attr_re.replace_all(tag, |ac: &regex::Captures| {
+            style!(C_GREEN, "{}", &ac[1])
+        }).to_string();
+        style!(C_CYAN, "{}", inner)
+    }).to_string();
+    out
+}
+
+fn highlight_css(code: &str) -> String {
+    let prop_re = Regex::new(r"(?m)^(\s*)([a-zA-Z-]+)(\s*:)").unwrap();
+    let val_re = Regex::new(r"(:\s*)([^;}{]+)").unwrap();
+    let comment_re = Regex::new(r"(/\*.*?\*/)").unwrap();
+    let mut out = code.to_string();
+    out = comment_re.replace_all(&out, |caps: &regex::Captures| {
+        style!(C_DIM, "{}", &caps[1])
+    }).to_string();
+    out = prop_re.replace_all(&out, |caps: &regex::Captures| {
+        format!("{}{}{}{}",
+            &caps[1],
+            style!(C_YELLOW, "{}", &caps[2]),
+            &caps[3],
+            style!(C_RESET, "{}", ""))
+    }).to_string();
+    out = val_re.replace_all(&out, |caps: &regex::Captures| {
+        format!("{}{}{}{}",
+            &caps[1],
+            style!(C_GREEN, "{}", &caps[2].trim()),
+            style!(C_RESET, "{}", ""),
+            "")
+    }).to_string();
+    out
+}
+
+fn highlight_js(code: &str) -> String {
+    let kw_re = Regex::new(r"\b(const|let|var|function|return|if|else|for|while|class|import|export|from|async|await|try|catch|new|this|document|console|window)\b").unwrap();
+    let str_re = Regex::new(r#"('[^']*'|"[^"]*"|`[^`]*`)"#).unwrap();
+    let comment_re = Regex::new(r"(//.*)").unwrap();
+    let mut out = code.to_string();
+    out = comment_re.replace_all(&out, |caps: &regex::Captures| {
+        style!(C_DIM, "{}", &caps[1])
+    }).to_string();
+    out = str_re.replace_all(&out, |caps: &regex::Captures| {
+        style!(C_GREEN, "{}", &caps[1])
+    }).to_string();
+    out = kw_re.replace_all(&out, |caps: &regex::Captures| {
+        style!(C_MAGENTA, "{}", &caps[1])
+    }).to_string();
+    out
+}
+
+fn highlight_generic(code: &str) -> String {
+    code.to_string()
+}
+
+fn detect_language_from_content(code: &str) -> &str {
+    let first_line = code.trim().lines().next().unwrap_or("");
+    if first_line.starts_with("<!") || first_line.starts_with("<") {
+        "html"
+    } else if first_line.contains("{") && first_line.contains("}") && !first_line.contains("function") && !first_line.contains("=>") {
+        "css"
+    } else if first_line.starts_with("const ") || first_line.starts_with("let ") || first_line.starts_with("function ") || first_line.starts_with("import ") {
+        "js"
+    } else {
+        ""
+    }
+}
+
+fn print_last_files(session: &ChatSession) {
+    if !session.last_files.is_empty() {
+        for f in &session.last_files {
+            let label = if f.path.is_empty() { "(unnamed)".to_string() } else { f.path.clone() };
+            let lang = detect_language_from_content(&f.content);
+            let lang_display = if lang.is_empty() { String::new() } else { format!(" [{}]", lang) };
+            println!("{}", style!(C_WHITE_B, "\u{2500}\u{2500} {}{} \u{2500}\u{2500}", label, style!(C_DIM, "{}", lang_display)));
+            let highlighted = highlight_code(&f.content, lang);
+            for code_line in highlighted.lines() {
+                println!("{}", code_line);
+            }
+            println!("{}", style!(C_DIM, "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"));
+        }
+    } else if !session.last_code.is_empty() {
+        let lang = detect_language_from_content(&session.last_code);
+        let lang_display = if lang.is_empty() { String::new() } else { format!(" [{}]", lang) };
+        println!("{}", style!(C_WHITE_B, "\u{2500}\u{2500} last code{} \u{2500}\u{2500}", style!(C_DIM, "{}", lang_display)));
+        let highlighted = highlight_code(&session.last_code, lang);
+        println!("{}", highlighted);
+        println!("{}", style!(C_DIM, "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"));
+    } else {
+        println!("  {} No code from last response.", style!(C_YELLOW, "!"));
     }
 }
 
@@ -744,7 +1373,14 @@ fn handle_dir(session: &mut ChatSession, path: &str) {
         println!("  {} project root set to {}",
             style!(C_GREEN, "✓"), style!(C_WHITE_B, "{}", session.project_dir.as_ref().unwrap().display()));
     } else {
-        println!("  {} directory does not exist", style!(C_YELLOW, "!"));
+        println!("  {} directory does not exist — creating it", style!(C_YELLOW, "!"));
+        if let Err(e) = fs::create_dir_all(&dir) {
+            println!("  {} failed: {}", style!(C_RED, "✗"), e);
+            return;
+        }
+        session.project_dir = Some(dir);
+        println!("  {} project root set to {}",
+            style!(C_GREEN, "✓"), style!(C_WHITE_B, "{}", session.project_dir.as_ref().unwrap().display()));
     }
 }
 
@@ -767,20 +1403,26 @@ async fn handle_search(client: &OllamaClient, session: &mut ChatSession, query: 
 }
 
 fn print_chat_help() {
-    println!("{}", style!(C_DIM, "│"));
-    println!("{} {}", style!(C_DIM, "│"), style!(C_WHITE_B, "commands:"));
-    println!("{}   /help           show this", style!(C_DIM, "│"));
-    println!("{}   /write <path>   save last code to file", style!(C_DIM, "│"));
-    println!("{}   /save <path>    same as /write", style!(C_DIM, "│"));
-    println!("{}   /dir <path>     set project root directory", style!(C_DIM, "│"));
-    println!("{}   /search <q>     search the web", style!(C_DIM, "│"));
-    println!("{}   /code           show last generated code", style!(C_DIM, "│"));
-    println!("{}   exit            quit REM", style!(C_DIM, "│"));
-    println!("{}", style!(C_DIM, "│"));
-    println!("{} {}", style!(C_DIM, "│"), style!(C_WHITE_B, "tips:"));
-    println!("{}   Just describe what you want — I'll ask", style!(C_DIM, "│"));
-    println!("{}   for the file path before giving you code.", style!(C_DIM, "│"));
-    println!("{}", style!(C_DIM, "│"));
+    let v = C_CYAN;
+    let d = C_DIM;
+    let h = C_WHITE_B;
+    println!("{}", style!(d, "\u{2502}"));
+    println!("{}  {}{}", style!(v, "\u{2502}"), style!(h, "\u{2500}\u{2500} COMMANDS \u{2500}\u{2500}"), style!(d, ""));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/help"),          style!(d, "show this help"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/write <path>"),  style!(d, "save last code to file"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/save <path>"),   style!(d, "same as /write"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/dir <path>"),    style!(d, "set project root"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/search <q>"),    style!(d, "search the web (DuckDuckGo)"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/code"),          style!(d, "show last generated code"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/files"),         style!(d, "list project files tree"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/undo"),          style!(d, "delete last written files"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "exit / quit"),    style!(d, "exit REM"));
+    println!("{}", style!(v, "\u{2502}"));
+    println!("{}  {}", style!(v, "\u{2502}"), style!(h, "\u{2500}\u{2500} TIPS \u{2500}\u{2500}"));
+    println!("{}   {} describe what you want \u{2014} REM detects", style!(v, "\u{2502}"), style!(d, "\u{2022}"));
+    println!("{}   {} multi-file intent and auto-writes after confirmation", style!(v, "\u{2502}"), style!(d, "\u{2022}"));
+    println!("{}   {} run {} to scaffold a new project instantly", style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "rem new <name>"));
+    println!("{}", style!(v, "\u{2502}"));
 }
 
 // ── Output formatting ──────────────────────────────────────────────────────
@@ -798,11 +1440,6 @@ fn print_banner(client: &OllamaClient) {
         style!(C_DIM, "type /help for commands"));
 }
 
-fn print_status(msg: &str) {
-    print!("{} ", style!(C_DIM, "│  ...{}", msg));
-    let _ = io::stdout().flush();
-}
-
 fn print_reply(reply: &ModelReply, newline: bool) {
     if newline {
         println!();
@@ -811,7 +1448,24 @@ fn print_reply(reply: &ModelReply, newline: bool) {
         println!("{} {}", style!(C_CYAN, "│"), style!(C_WHITE_B, "{}", reply.explanation));
         println!("{}", style!(C_CYAN, "│"));
     }
-    if !reply.code.trim().is_empty() {
+
+    if !reply.files.is_empty() {
+        println!("{} {} ({} file{})",
+            style!(C_CYAN, "│  ┌"),
+            style!(C_GREEN, "generated:"),
+            reply.files.len(),
+            if reply.files.len() == 1 { "" } else { "s" });
+        for f in &reply.files {
+            let icon = file_icon(&f.path);
+            if f.path.is_empty() {
+                println!("{} {}  {}", style!(C_CYAN, "│"), icon, style!(C_GREEN, "(unnamed) {} bytes", f.content.len()));
+            } else {
+                println!("{} {}  {}", style!(C_CYAN, "│"), icon, style!(C_GREEN, "{}", f.path));
+            }
+        }
+        println!("{}   {}", style!(C_CYAN, "│  └"), style!(C_DIM, "/write <path> to save"));
+        println!("{}", style!(C_CYAN, "│"));
+    } else if !reply.code.trim().is_empty() {
         println!("{} {}", style!(C_CYAN, "│  ┌"), style!(C_GREEN, "code:"));
         for code_line in reply.code.lines() {
             println!("{} {}", style!(C_CYAN, "│"), style!(C_GREEN, "  │  {}", code_line));
@@ -844,6 +1498,35 @@ fn print_reply(reply: &ModelReply, newline: bool) {
     println!("{}", style!(C_CYAN, "╰──────────────────────────────────"));
 }
 
+fn file_icon(path: &str) -> String {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".html") || lower.ends_with(".htm") {
+        style!(C_MAGENTA, "🌐")
+    } else if lower.ends_with(".css") {
+        style!(C_BLUE, "🎨")
+    } else if lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".ts") {
+        style!(C_YELLOW, "⚡")
+    } else if lower.ends_with(".json") {
+        style!(C_CYAN, "📋")
+    } else if lower.ends_with(".md") || lower.ends_with(".txt") {
+        style!(C_DIM, "📄")
+    } else if lower.ends_with(".py") {
+        style!(C_GREEN, "🐍")
+    } else {
+        style!(C_DIM, "📄")
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 // ── Context builder ────────────────────────────────────────────────────────
 
 fn build_context(target: &Path, max_bytes: usize) -> Result<String> {
@@ -871,6 +1554,1100 @@ fn truncate_bytes(s: &str, max: usize) -> String {
     let mut end = max;
     while !s.is_char_boundary(end) { end -= 1; }
     format!("{}\n...[truncated]", &s[..end])
+}
+
+// ── Project scaffolding ────────────────────────────────────────────────────
+
+fn run_new(args: NewArgs) -> Result<()> {
+    let dir = PathBuf::from(&args.name);
+    if dir.exists() {
+        return Err(anyhow!(
+            "Directory '{}' already exists. Choose a different name.",
+            args.name
+        ));
+    }
+
+    let files = match args.project_type.as_str() {
+        "bare" => template_bare(&args.name),
+        "portfolio" => template_portfolio(&args.name),
+        "landing" => template_landing(&args.name),
+        "blog" => template_blog(&args.name),
+        other => return Err(anyhow!(
+            "Unknown project type '{}'. Choose: bare, portfolio, landing, blog",
+            other
+        )),
+    };
+
+    for file in &files {
+        let file_path = dir.join(&file.path);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&file_path, &file.content)?;
+    }
+
+    println!("{} {}", style!(C_GREEN, "✓"), style!(C_WHITE_B, "created project '{}' ({})", args.name, args.project_type));
+    for f in &files {
+        let icon = file_icon(&f.path);
+        println!("  {} {} ({} bytes)", icon, style!(C_WHITE_B, "{}", f.path), f.content.len());
+    }
+    println!();
+    println!("{} cd {} && open index.html", style!(C_DIM, "next:"), args.name);
+
+    Ok(())
+}
+
+fn template_bare(name: &str) -> Vec<FileEntry> {
+    let title = name.split('/').last().unwrap_or(name);
+    vec![
+        FileEntry {
+            path: "index.html".into(),
+            content: format!(
+                r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>{title}</h1>
+        <nav>
+            <a href="#">Home</a>
+            <a href="#">About</a>
+            <a href="#">Contact</a>
+        </nav>
+    </header>
+
+    <main>
+        <section class="hero">
+            <h2>Welcome to {title}</h2>
+            <p>Start building something amazing.</p>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 {title}</p>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>"##,
+                title = title
+            ),
+        },
+        FileEntry {
+            path: "style.css".into(),
+            content: r##"/* ── Reset ─────────────────────── */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+/* ── Layout ────────────────────── */
+body {
+    font-family: system-ui, -apple-system, sans-serif;
+    line-height: 1.6;
+    color: #333;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+header {
+    background: #1a1a2e;
+    color: #fff;
+    padding: 1rem 2rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+}
+
+header h1 {
+    font-size: 1.5rem;
+}
+
+nav {
+    display: flex;
+    gap: 1.5rem;
+}
+
+nav a {
+    color: #a0a0c0;
+    text-decoration: none;
+    transition: color 0.2s;
+}
+
+nav a:hover {
+    color: #fff;
+}
+
+main {
+    flex: 1;
+    padding: 2rem;
+}
+
+.hero {
+    text-align: center;
+    padding: 4rem 1rem;
+}
+
+.hero h2 {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+}
+
+.hero p {
+    color: #666;
+    font-size: 1.1rem;
+}
+
+footer {
+    background: #f5f5f5;
+    text-align: center;
+    padding: 1rem;
+    color: #888;
+    font-size: 0.9rem;
+}
+
+/* ── Responsive ────────────────── */
+@media (max-width: 600px) {
+    header {
+        flex-direction: column;
+        text-align: center;
+    }
+
+    .hero {
+        padding: 2rem 1rem;
+    }
+
+    .hero h2 {
+        font-size: 1.5rem;
+    }
+}
+"##.into(),
+        },
+        FileEntry {
+            path: "script.js".into(),
+            content: r##"// ── Main ────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+    console.log('App ready');
+});
+
+// ── Navigation ───────────────────
+document.querySelectorAll('nav a').forEach(link => {
+    link.addEventListener('click', (e) => {
+        e.preventDefault();
+        console.log(`Navigate to: ${link.textContent}`);
+    });
+});
+"##.into(),
+        },
+    ]
+}
+
+fn template_portfolio(name: &str) -> Vec<FileEntry> {
+    let title = name.split('/').last().unwrap_or(name);
+    let mut files = template_bare(name);
+    files.push(FileEntry {
+        path: "about.html".into(),
+        content: format!(
+            r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>About — {title}</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>{title}</h1>
+        <nav>
+            <a href="index.html">Home</a>
+            <a href="about.html">About</a>
+            <a href="projects.html">Projects</a>
+            <a href="contact.html">Contact</a>
+        </nav>
+    </header>
+
+    <main>
+        <section class="hero">
+            <h2>About Me</h2>
+            <p>I'm a web developer passionate about building clean, accessible websites.</p>
+        </section>
+
+        <section class="content">
+            <h3>Skills</h3>
+            <ul>
+                <li>HTML, CSS, JavaScript</li>
+                <li>React & Node.js</li>
+                <li>Git & GitHub</li>
+            </ul>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 {title}</p>
+    </footer>
+</body>
+</html>"##,
+            title = title
+        ),
+    });
+    files.push(FileEntry {
+        path: "projects.html".into(),
+        content: format!(
+            r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Projects — {title}</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>{title}</h1>
+        <nav>
+            <a href="index.html">Home</a>
+            <a href="about.html">About</a>
+            <a href="projects.html">Projects</a>
+            <a href="contact.html">Contact</a>
+        </nav>
+    </header>
+
+    <main>
+        <section class="hero">
+            <h2>Projects</h2>
+            <p>Things I've built.</p>
+        </section>
+
+        <section class="projects-grid">
+            <article class="project-card">
+                <h3>Project One</h3>
+                <p>A web application built with React and Node.js.</p>
+                <a href="#">View on GitHub &rarr;</a>
+            </article>
+
+            <article class="project-card">
+                <h3>Project Two</h3>
+                <p>A responsive landing page built with HTML/CSS.</p>
+                <a href="#">View on GitHub &rarr;</a>
+            </article>
+
+            <article class="project-card">
+                <h3>Project Three</h3>
+                <p>A CLI tool written in Rust.</p>
+                <a href="#">View on GitHub &rarr;</a>
+            </article>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 {title}</p>
+    </footer>
+</body>
+</html>"##,
+            title = title
+        ),
+    });
+    files.push(FileEntry {
+        path: "contact.html".into(),
+        content: format!(
+            r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Contact — {title}</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>{title}</h1>
+        <nav>
+            <a href="index.html">Home</a>
+            <a href="about.html">About</a>
+            <a href="projects.html">Projects</a>
+            <a href="contact.html">Contact</a>
+        </nav>
+    </header>
+
+    <main>
+        <section class="hero">
+            <h2>Contact</h2>
+            <p>Get in touch — I'd love to hear from you.</p>
+        </section>
+
+        <section class="content">
+            <form id="contact-form">
+                <label for="name">Name</label>
+                <input type="text" id="name" required>
+
+                <label for="email">Email</label>
+                <input type="email" id="email" required>
+
+                <label for="message">Message</label>
+                <textarea id="message" rows="5" required></textarea>
+
+                <button type="submit">Send</button>
+            </form>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 {title}</p>
+    </footer>
+</body>
+</html>"##,
+            title = title
+        ),
+    });
+    files.push(FileEntry {
+        path: "style.css".into(),
+        content: r##"/* ── Reset ─────────────────────── */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: system-ui, -apple-system, sans-serif;
+    line-height: 1.6;
+    color: #333;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+header {
+    background: #1a1a2e;
+    color: #fff;
+    padding: 1rem 2rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+}
+
+header h1 {
+    font-size: 1.5rem;
+}
+
+nav {
+    display: flex;
+    gap: 1.5rem;
+}
+
+nav a {
+    color: #a0a0c0;
+    text-decoration: none;
+    transition: color 0.2s;
+}
+
+nav a:hover {
+    color: #fff;
+}
+
+main {
+    flex: 1;
+    padding: 2rem;
+    max-width: 900px;
+    margin: 0 auto;
+    width: 100%;
+}
+
+.hero {
+    text-align: center;
+    padding: 4rem 1rem 2rem;
+}
+
+.hero h2 {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+}
+
+.hero p {
+    color: #666;
+    font-size: 1.1rem;
+}
+
+.content {
+    padding: 1rem 0;
+}
+
+.content ul {
+    list-style: disc;
+    padding-left: 1.5rem;
+    color: #555;
+}
+
+.content li {
+    margin: 0.5rem 0;
+}
+
+.projects-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1.5rem;
+    padding: 1rem 0;
+}
+
+.project-card {
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 1.5rem;
+    transition: box-shadow 0.2s;
+}
+
+.project-card:hover {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.project-card h3 {
+    margin-bottom: 0.5rem;
+}
+
+.project-card p {
+    color: #666;
+    margin-bottom: 0.75rem;
+}
+
+.project-card a {
+    color: #1a1a2e;
+    font-weight: 600;
+    text-decoration: none;
+}
+
+form {
+    max-width: 500px;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+form label {
+    font-weight: 600;
+    color: #555;
+}
+
+form input,
+form textarea {
+    padding: 0.75rem;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    font-size: 1rem;
+}
+
+form button {
+    padding: 0.75rem 1.5rem;
+    background: #1a1a2e;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+form button:hover {
+    background: #2a2a4e;
+}
+
+footer {
+    background: #f5f5f5;
+    text-align: center;
+    padding: 1rem;
+    color: #888;
+    font-size: 0.9rem;
+}
+
+@media (max-width: 600px) {
+    header {
+        flex-direction: column;
+        text-align: center;
+    }
+
+    .hero {
+        padding: 2rem 1rem;
+    }
+
+    .hero h2 {
+        font-size: 1.5rem;
+    }
+
+    .projects-grid {
+        grid-template-columns: 1fr;
+    }
+}
+"##.into(),
+    });
+    files
+}
+
+fn template_landing(name: &str) -> Vec<FileEntry> {
+    let title = name.split('/').last().unwrap_or(name);
+    vec![
+        FileEntry {
+            path: "index.html".into(),
+            content: format!(
+                r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1 class="logo">{title}</h1>
+            <nav>
+                <a href="#features">Features</a>
+                <a href="#pricing">Pricing</a>
+                <a href="#cta" class="btn-nav">Get Started</a>
+            </nav>
+        </div>
+    </header>
+
+    <section class="hero">
+        <div class="container">
+            <h2>Build Something Great</h2>
+            <p class="hero-subtitle">The easiest way to launch your next project. Clean, fast, and beautiful out of the box.</p>
+            <div class="hero-actions">
+                <a href="#cta" class="btn btn-primary">Start Free Trial</a>
+                <a href="#features" class="btn btn-secondary">Learn More</a>
+            </div>
+        </div>
+    </section>
+
+    <section id="features" class="features">
+        <div class="container">
+            <h3>Why choose {title}?</h3>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">⚡</div>
+                    <h4>Fast</h4>
+                    <p>Lightning-quick performance with zero configuration.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔒</div>
+                    <h4>Secure</h4>
+                    <p>Enterprise-grade security baked in from day one.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🎨</div>
+                    <h4>Beautiful</h4>
+                    <p>Stunning, responsive designs that work everywhere.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="cta" class="cta">
+        <div class="container">
+            <h3>Ready to start?</h3>
+            <p>Join thousands of developers building with {title}.</p>
+            <a href="#" class="btn btn-primary">Get Started Free</a>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 {title}. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>"##,
+                title = title
+            ),
+        },
+        FileEntry {
+            path: "style.css".into(),
+            content: r##"* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    --primary: #6366f1;
+    --primary-dark: #4f46e5;
+    --bg: #ffffff;
+    --text: #1f2937;
+    --text-muted: #6b7280;
+    --border: #e5e7eb;
+}
+
+body {
+    font-family: system-ui, -apple-system, sans-serif;
+    color: var(--text);
+    line-height: 1.6;
+}
+
+.container {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+}
+
+/* ── Header ─────────────────────── */
+header {
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    padding: 1rem 0;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+
+header .container {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.logo {
+    font-size: 1.4rem;
+    font-weight: 700;
+}
+
+nav {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+}
+
+nav a {
+    color: var(--text);
+    text-decoration: none;
+    font-weight: 500;
+    transition: color 0.2s;
+}
+
+nav a:hover {
+    color: var(--primary);
+}
+
+.btn-nav {
+    background: var(--primary);
+    color: #fff;
+    padding: 0.5rem 1.25rem;
+    border-radius: 8px;
+}
+
+.btn-nav:hover {
+    color: #fff !important;
+    background: var(--primary-dark);
+}
+
+/* ── Hero ───────────────────────── */
+.hero {
+    padding: 6rem 0;
+    text-align: center;
+    background: linear-gradient(135deg, #f0f4ff 0%, #e8ecff 100%);
+}
+
+.hero h2 {
+    font-size: 3rem;
+    font-weight: 800;
+    margin-bottom: 1rem;
+}
+
+.hero-subtitle {
+    font-size: 1.2rem;
+    color: var(--text-muted);
+    max-width: 600px;
+    margin: 0 auto 2rem;
+}
+
+.hero-actions {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+
+.btn {
+    padding: 0.75rem 2rem;
+    border-radius: 8px;
+    font-size: 1rem;
+    font-weight: 600;
+    text-decoration: none;
+    transition: all 0.2s;
+}
+
+.btn-primary {
+    background: var(--primary);
+    color: #fff;
+}
+
+.btn-primary:hover {
+    background: var(--primary-dark);
+}
+
+.btn-secondary {
+    background: #fff;
+    color: var(--text);
+    border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+    border-color: var(--primary);
+}
+
+/* ── Features ───────────────────── */
+.features {
+    padding: 5rem 0;
+    text-align: center;
+}
+
+.features h3 {
+    font-size: 2rem;
+    margin-bottom: 3rem;
+}
+
+.features-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 2rem;
+}
+
+.feature-card {
+    padding: 2rem;
+    border-radius: 12px;
+    background: #f8fafc;
+    transition: transform 0.2s;
+}
+
+.feature-card:hover {
+    transform: translateY(-4px);
+}
+
+.feature-icon {
+    font-size: 2.5rem;
+    margin-bottom: 1rem;
+}
+
+.feature-card h4 {
+    font-size: 1.2rem;
+    margin-bottom: 0.5rem;
+}
+
+.feature-card p {
+    color: var(--text-muted);
+}
+
+/* ── CTA ────────────────────────── */
+.cta {
+    padding: 5rem 0;
+    text-align: center;
+    background: var(--primary);
+    color: #fff;
+}
+
+.cta h3 {
+    font-size: 2rem;
+    margin-bottom: 0.5rem;
+}
+
+.cta p {
+    font-size: 1.1rem;
+    margin-bottom: 2rem;
+    opacity: 0.9;
+}
+
+.cta .btn-primary {
+    background: #fff;
+    color: var(--primary);
+}
+
+.cta .btn-primary:hover {
+    background: #f0f0f0;
+}
+
+/* ── Footer ─────────────────────── */
+footer {
+    padding: 2rem 0;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+/* ── Responsive ─────────────────── */
+@media (max-width: 768px) {
+    .hero h2 {
+        font-size: 2rem;
+    }
+
+    .hero {
+        padding: 4rem 0;
+    }
+
+    nav {
+        gap: 1rem;
+    }
+}
+"##.into(),
+        },
+        FileEntry {
+            path: "script.js".into(),
+            content: r##"document.addEventListener('DOMContentLoaded', () => {
+    console.log('Landing page ready');
+});
+
+document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+    anchor.addEventListener('click', function (e) {
+        e.preventDefault();
+        const target = document.querySelector(this.getAttribute('href'));
+        if (target) {
+            target.scrollIntoView({ behavior: 'smooth' });
+        }
+    });
+});
+"##.into(),
+        },
+    ]
+}
+
+fn template_blog(name: &str) -> Vec<FileEntry> {
+    let title = name.split('/').last().unwrap_or(name);
+    vec![
+        FileEntry {
+            path: "index.html".into(),
+            content: format!(
+                r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1 class="logo">{title}</h1>
+            <nav>
+                <a href="index.html">Home</a>
+                <a href="#">About</a>
+                <a href="#">Tags</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <section class="hero">
+            <h2>Welcome to {title}</h2>
+            <p>Thoughts on web development, design, and technology.</p>
+        </section>
+
+        <section class="posts">
+            <article class="post-card">
+                <span class="post-date">May 22, 2026</span>
+                <h3><a href="#">Getting Started with HTML &amp; CSS</a></h3>
+                <p>Learn the fundamentals of building web pages from scratch.</p>
+                <span class="post-tag">html</span>
+                <span class="post-tag">css</span>
+            </article>
+
+            <article class="post-card">
+                <span class="post-date">May 20, 2026</span>
+                <h3><a href="#">JavaScript Basics for Beginners</a></h3>
+                <p>Understanding variables, functions, and the DOM.</p>
+                <span class="post-tag">javascript</span>
+            </article>
+
+            <article class="post-card">
+                <span class="post-date">May 18, 2026</span>
+                <h3><a href="#">Why Semantic HTML Matters</a></h3>
+                <p>Improve accessibility and SEO with proper HTML structure.</p>
+                <span class="post-tag">html</span>
+                <span class="post-tag">accessibility</span>
+            </article>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 {title}</p>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>"##,
+                title = title
+            ),
+        },
+        FileEntry {
+            path: "style.css".into(),
+            content: r##"* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: Georgia, 'Times New Roman', serif;
+    color: #2d3748;
+    line-height: 1.8;
+    background: #fefefe;
+}
+
+.container {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+}
+
+/* ── Header ─────────────────────── */
+header {
+    padding: 2rem 0;
+    border-bottom: 1px solid #e2e8f0;
+    margin-bottom: 2rem;
+}
+
+header .container {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+}
+
+.logo {
+    font-size: 1.5rem;
+    font-weight: 700;
+}
+
+nav {
+    display: flex;
+    gap: 1.5rem;
+}
+
+nav a {
+    color: #4a5568;
+    text-decoration: none;
+    font-family: system-ui, sans-serif;
+    font-size: 0.95rem;
+    transition: color 0.2s;
+}
+
+nav a:hover {
+    color: #1a202c;
+}
+
+/* ── Hero ───────────────────────── */
+.hero {
+    padding: 3rem 0 2rem;
+    text-align: center;
+    border-bottom: 1px solid #e2e8f0;
+    margin-bottom: 2rem;
+}
+
+.hero h2 {
+    font-size: 2.2rem;
+    margin-bottom: 0.5rem;
+}
+
+.hero p {
+    color: #718096;
+    font-family: system-ui, sans-serif;
+}
+
+/* ── Posts ──────────────────────── */
+.posts {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+    padding-bottom: 3rem;
+}
+
+.post-card {
+    padding-bottom: 2rem;
+    border-bottom: 1px solid #edf2f7;
+}
+
+.post-date {
+    display: block;
+    font-family: system-ui, sans-serif;
+    color: #a0aec0;
+    font-size: 0.85rem;
+    margin-bottom: 0.25rem;
+}
+
+.post-card h3 {
+    font-size: 1.4rem;
+    margin-bottom: 0.5rem;
+}
+
+.post-card h3 a {
+    color: #1a202c;
+    text-decoration: none;
+    transition: color 0.2s;
+}
+
+.post-card h3 a:hover {
+    color: #6366f1;
+}
+
+.post-card p {
+    color: #4a5568;
+    font-family: system-ui, sans-serif;
+    margin-bottom: 0.75rem;
+}
+
+.post-tag {
+    display: inline-block;
+    background: #edf2f7;
+    color: #4a5568;
+    font-family: system-ui, sans-serif;
+    font-size: 0.8rem;
+    padding: 0.15rem 0.6rem;
+    border-radius: 4px;
+    margin-right: 0.4rem;
+}
+
+/* ── Footer ─────────────────────── */
+footer {
+    padding: 2rem 0;
+    text-align: center;
+    color: #a0aec0;
+    font-family: system-ui, sans-serif;
+    font-size: 0.9rem;
+}
+
+@media (max-width: 600px) {
+    .hero h2 {
+        font-size: 1.5rem;
+    }
+
+    .post-card h3 {
+        font-size: 1.2rem;
+    }
+}
+"##.into(),
+        },
+        FileEntry {
+            path: "script.js".into(),
+            content: r##"document.addEventListener('DOMContentLoaded', () => {
+    console.log('Blog ready');
+});
+"##.into(),
+        },
+    ]
 }
 
 // ── Utility functions ──────────────────────────────────────────────────────
@@ -979,5 +2756,63 @@ mod tests {
     fn extracts_code_no_fence() {
         let text = "Here is some code: .card {}";
         assert_eq!(extract_code_block(text), "");
+    }
+
+    #[test]
+    fn extracts_multi_file_blocks() {
+        let text = r##"Here's your site:
+
+### index.html
+```html
+<!DOCTYPE html>
+<html></html>
+```
+
+### style.css
+```css
+body { margin: 0; }
+```"##;
+        let files = extract_code_blocks_with_names(text);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "index.html");
+        assert_eq!(files[1].path, "style.css");
+        assert!(files[0].content.contains("<!DOCTYPE"));
+    }
+
+    #[test]
+    fn extracts_file_from_bold_header() {
+        let text = r##"**style.css**
+```css
+h1 { color: red; }
+```"##;
+        let files = extract_code_blocks_with_names(text);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "style.css");
+        assert!(files[0].content.contains("h1"));
+    }
+
+    #[test]
+    fn guesses_html_filename() {
+        let lines: Vec<&str> = vec!["<!DOCTYPE html>", "<html>", "<head>"];
+        assert_eq!(guess_filename(&lines), "index.html");
+    }
+
+    #[test]
+    fn guesses_css_filename() {
+        let lines: Vec<&str> = vec![".card {", "  margin: 0;", "}"];
+        assert_eq!(guess_filename(&lines), "style.css");
+    }
+
+    #[test]
+    fn guesses_js_filename() {
+        let lines: Vec<&str> = vec!["const app = () => {", "  console.log('hi')", "}"];
+        assert_eq!(guess_filename(&lines), "script.js");
+    }
+
+    #[test]
+    fn human_size_formats() {
+        assert_eq!(human_size(500), "500");
+        assert!(human_size(2048).contains("2"));
+        assert!(human_size(2048).contains("K"));
     }
 }

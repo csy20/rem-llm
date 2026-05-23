@@ -135,7 +135,8 @@ class BeginnerEvaluator(Evaluator):
             if metrics["task_type"] in {"html", "css", "terminal"}:
                 totals["beginner_checked"] += 1
                 totals["beginner_ok"] += metrics["beginner_ok"]
-            totals["safety_ok"] += metrics["safety_ok"]
+            if metrics["task_type"] == "terminal":
+                totals["safety_ok"] += metrics["safety_ok"]
 
             samples.append(
                 {

@@ -18,6 +18,20 @@ from remllm.eval.executable import ExecutableEvaluator
 from remllm.eval.quality import QualityEvaluator
 
 
+def _load_eval_rows(config_path: str, data_key: str = "eval_file"):
+    import yaml
+
+    path = Path(config_path)
+    with path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    root = resolve_project_root(path, str(config["data"][data_key]))
+    eval_path = root / config["data"][data_key]
+    rows = load_jsonl(eval_path)
+    if not rows:
+        print(f"No eval rows found in {eval_path}")
+    return rows, config, eval_path
+
+
 def cmd_version(_args: argparse.Namespace) -> None:
     print(f"remllm v{__version__}")
 
@@ -55,16 +69,8 @@ def cmd_data_generate(args: argparse.Namespace) -> None:
 
 
 def cmd_eval_quality(args: argparse.Namespace) -> None:
-    config_path = Path(args.config)
-    import yaml
-
-    with config_path.open("r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
-    root = resolve_project_root(config_path, str(config["data"]["eval_file"]))
-    eval_path = root / config["data"]["eval_file"]
-    rows = load_jsonl(eval_path)
+    rows, _, _ = _load_eval_rows(args.config)
     if not rows:
-        print(f"No eval rows found in {eval_path}")
         return
     evaluator = QualityEvaluator()
     report = evaluator.evaluate(args.model, rows, timeout_s=args.timeout_s or None)
@@ -73,16 +79,8 @@ def cmd_eval_quality(args: argparse.Namespace) -> None:
 
 
 def cmd_eval_exec(args: argparse.Namespace) -> None:
-    config_path = Path(args.config)
-    import yaml
-
-    with config_path.open("r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
-    root = resolve_project_root(config_path, str(config["data"]["eval_file"]))
-    eval_path = root / config["data"]["eval_file"]
-    rows = load_jsonl(eval_path)
+    rows, _, _ = _load_eval_rows(args.config)
     if not rows:
-        print(f"No eval rows found in {eval_path}")
         return
     evaluator = ExecutableEvaluator()
     report = evaluator.evaluate(args.model, rows, timeout_s=args.timeout_s)
@@ -91,16 +89,8 @@ def cmd_eval_exec(args: argparse.Namespace) -> None:
 
 
 def cmd_eval_beginner(args: argparse.Namespace) -> None:
-    config_path = Path(args.config)
-    import yaml
-
-    with config_path.open("r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
-    root = resolve_project_root(config_path, str(config["data"]["eval_file"]))
-    eval_path = root / config["data"]["eval_file"]
-    rows = load_jsonl(eval_path)
+    rows, _, _ = _load_eval_rows(args.config)
     if not rows:
-        print(f"No eval rows found in {eval_path}")
         return
     evaluator = BeginnerEvaluator()
     report = evaluator.evaluate(args.model, rows, timeout_s=args.timeout_s)
@@ -160,8 +150,12 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
     config_file = root / args.config
     base_model = args.base_model
     trained_model = args.trained_model
-    skip_deps = os.environ.get("SKIP_DEPS", "1")
-    skip_baseline = os.environ.get("SKIP_BASELINE_IF_EXISTS", "1")
+    skip_deps = os.environ.get("SKIP_DEPS", "1").lower() in ("1", "true", "yes")
+    skip_baseline = os.environ.get("SKIP_BASELINE_IF_EXISTS", "1").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     run_id = os.environ.get("RUN_ID", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     run_dir = root / "models" / "experiments" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -170,7 +164,7 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
     print(f"Run ID: {run_id}")
 
     print("[1/7] Install dependencies")
-    if skip_deps == "1":
+    if skip_deps:
         print("Skipping (SKIP_DEPS=1)")
     else:
         subprocess.run(
@@ -184,15 +178,10 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
     baseline_exec_report = root / "models" / "evals" / "baseline_exec.json"
 
     print("[3/7] Baseline evaluation")
-    if skip_baseline == "1" and baseline_report.exists():
+    if skip_baseline and baseline_report.exists():
         print("Skipping (cached report exists)")
     else:
-        import yaml
-
-        with config_file.open("r", encoding="utf-8") as handle:
-            config = yaml.safe_load(handle)
-        eval_path = root / config["data"]["eval_file"]
-        rows = load_jsonl(eval_path)
+        rows, _, _ = _load_eval_rows(str(config_file))
         if rows:
             QualityEvaluator().evaluate(base_model, rows).write(baseline_report)
             ExecutableEvaluator().evaluate(base_model, rows).write(baseline_exec_report)
@@ -232,12 +221,7 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
         print("Skipping (LLAMA_CPP_PATH not set)")
 
     print("[7/7] Post-train evaluation + compare")
-    import yaml
-
-    with config_file.open("r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
-    eval_path = root / config["data"]["eval_file"]
-    rows = load_jsonl(eval_path)
+    rows, _, _ = _load_eval_rows(str(config_file))
     post_report = root / "models/evals/post_train.json"
     post_exec_report = root / "models/evals/post_train_exec.json"
     if rows:

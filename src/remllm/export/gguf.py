@@ -12,12 +12,12 @@ def export_gguf(
     quant_list: list[str] | None = None,
 ) -> None:
     if not merged_dir.exists():
-        raise SystemExit(
+        raise FileNotFoundError(
             f"Merged model not found at {merged_dir}. Run merge_adapter first."
         )
 
     if not llama_cpp_path.exists():
-        raise SystemExit(
+        raise FileNotFoundError(
             f"llama.cpp path not found: {llama_cpp_path}. Set LLAMA_CPP_PATH correctly."
         )
 
@@ -75,7 +75,7 @@ def main():
     args = parser.parse_args()
 
     if not args.llama_cpp_path:
-        raise SystemExit("Set --llama-cpp-path or LLAMA_CPP_PATH env var.")
+        raise ValueError("Set --llama-cpp-path or LLAMA_CPP_PATH env var.")
 
     quant_list = [q.strip() for q in args.quants.split(",") if q.strip()]
     export_gguf(

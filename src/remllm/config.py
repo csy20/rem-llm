@@ -92,6 +92,8 @@ def load_config_dict(path: Path) -> dict:
 
 def resolve_project_root(config_path: Path, data_file_hint: str = "") -> Path:
     """Resolve repository root for both config/config.yaml and config/domains/*.yaml layouts."""
+    import warnings
+
     candidates = [
         Path.cwd(),
         config_path.parent.parent,
@@ -112,4 +114,9 @@ def resolve_project_root(config_path: Path, data_file_hint: str = "") -> Path:
         if (base / "pyproject.toml").exists():
             return base
 
+    warnings.warn(
+        f"Could not resolve project root from config '{config_path}'. "
+        f"Falling back to CWD: {Path.cwd()}. "
+        "Install a pyproject.toml or use absolute data paths."
+    )
     return Path.cwd()

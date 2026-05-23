@@ -94,7 +94,10 @@ def check_sql_exec(code_text: str, context_text: str) -> tuple[int, str]:
             column_sql = ", ".join(f"{column_name} TEXT" for column_name in columns)
             cursor.execute(f"CREATE TABLE {table_name} ({column_sql})")
         cursor.execute("BEGIN")
-        cursor.execute(statements)
+        for stmt in statements.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                cursor.execute(stmt)
         cursor.fetchall()
         connection.rollback()
         connection.close()

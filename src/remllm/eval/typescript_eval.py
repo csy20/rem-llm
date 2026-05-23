@@ -32,13 +32,25 @@ def check_typescript_typecheck(code_text: str, timeout_s: int = 30) -> tuple[int
             encoding="utf-8",
         )
 
-        process = subprocess.run(
-            ["npx", "--yes", "typescript", "--noEmit", "--project", str(temp_dir)],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_s,
-        )
+        import shutil
+
+        tsx = shutil.which("tsc")
+        if tsx:
+            process = subprocess.run(
+                [tsx, "--noEmit", "--project", str(temp_dir)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_s,
+            )
+        else:
+            process = subprocess.run(
+                ["npx", "--yes", "typescript", "--noEmit", "--project", str(temp_dir)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_s,
+            )
         if process.returncode != 0:
             error_lines = process.stdout.strip().splitlines()
             errors = [l for l in error_lines if "error TS" in l]
@@ -55,8 +67,10 @@ def check_import_structure(code_text: str) -> tuple[int, str]:
             issues.append(f"L{i + 1}: malformed import")
         if "require(" in stripped:
             issues.append(f"L{i + 1}: CommonJS require detected, prefer ESM imports")
-        if stripped.startswith("export default") and not stripped.endswith((";", "}")):
-            pass
+        if stripped.startswith("export default") and not stripped.endswith(
+            (";", "}", ")", ",")
+        ):
+            issues.append(f"L{i + 1}: export default missing terminator")
     if issues:
         return 0, "; ".join(issues[:3])
     return 1, "ok"

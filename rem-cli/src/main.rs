@@ -49,18 +49,23 @@ Rules:
 - Prefer complete, runnable examples.
 "##;
 
-const CHAT_SYSTEM_PROMPT: &str = r##"You are REM, a friendly and helpful coding assistant.
-You speak conversationally and help beginners with:
+const CHAT_SYSTEM_PROMPT_CONVERSATIONAL: &str = r##"You are REM, a fast and helpful coding assistant.
 
-- HTML and CSS for building web pages
-- JavaScript for interactivity
-- Safe terminal commands (never sudo, rm -rf, or dangerous pipes)
-- General programming questions
+RULES — follow strictly:
+1. Answer concisely in plain text or markdown. No code generation unless explicitly asked.
+2. If the user asks "how would you...", "what's the best way...", "should I use X or Y" — give a plan with trade-offs, but NO code.
+3. If you need current info (versions, docs), briefly suggest: "/search <query>". Never guess.
+4. Keep it short. The user is a developer.
+"##;
 
-You can search the web. When you need current information, tell the user to type /search <query> and you'll incorporate the results.
+const CHAT_SYSTEM_PROMPT_CODE: &str = r##"You are REM, a fast and helpful coding assistant.
 
-IMPORTANT — Multi-file format:
-When the user asks for a website or project that needs multiple files, output them using this format:
+RULES — follow strictly:
+1. The user explicitly asked for code. Generate complete, runnable files using the multi-file format below.
+2. Keep explanations minimal. Focus on working code.
+
+=== MULTI-FILE FORMAT ===
+Each file MUST have its own ### heading with the full path, then a code fence.
 
 ### path/to/file.html
 ```html
@@ -72,18 +77,7 @@ When the user asks for a website or project that needs multiple files, output th
 <file content here>
 ```
 
-### path/to/script.js
-```js
-<file content here>
-```
-
-Each file MUST have its own heading (three hashes) with the file path, then a code fence. This lets the CLI auto-save all files at once. Always provide complete, runnable code.
-
-Guidelines:
-- Be conversational — use markdown for formatting, code fences for code blocks.
-- When the user wants a website, write complete, runnable HTML+CSS (and JS if needed).
-- If you're unsure about something, let the user know and suggest a web search.
-- Keep responses helpful but concise.
+Always provide complete, runnable code.
 "##;
 
 const BLOCKED_COMMAND_PATTERNS: [&str; 10] = [
@@ -892,7 +886,15 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
         let line = session.readline(&prompt);
         let line = match line {
             Ok(s) => s,
-            Err(_) => break,
+            Err(e) => {
+                eprintln!("  {} input error: {}", style!(C_RED, "err:"), e);
+                if e.kind() == io::ErrorKind::Interrupted
+                    || e.kind() == io::ErrorKind::UnexpectedEof
+                {
+                    break;
+                }
+                continue;
+            }
         };
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
@@ -955,10 +957,15 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
             }
         };
 
+        let intent = classify_intent(trimmed);
+        let instruction = intent_instruction(&intent);
+
         let search_ctx = session.build_search_context();
         let history_ctx = session.build_chat_history();
         let full_prompt = {
-            let mut p = final_prompt;
+            let mut p = instruction.to_string();
+            p.push('\n');
+            p.push_str(&final_prompt);
             if !search_ctx.is_empty() {
                 p.push_str(&search_ctx);
             }
@@ -970,7 +977,11 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
 
         let start = std::time::Instant::now();
         let (spin_flag, spin_handle) = spawn_spinner("REM is writing...");
-        let result = client.complete_chat_stream(&full_prompt, CHAT_SYSTEM_PROMPT, &history_ctx).await;
+        let system_prompt = match intent {
+            TaskIntent::CodeAction => CHAT_SYSTEM_PROMPT_CODE,
+            _ => CHAT_SYSTEM_PROMPT_CONVERSATIONAL,
+        };
+        let result = client.complete_chat_stream(&full_prompt, system_prompt, &history_ctx).await;
         clear_spinner(spin_flag, spin_handle).await;
         let elapsed = start.elapsed();
 
@@ -980,43 +991,66 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
                     eprintln!("\n  {} raw response:\n{}\n", style!(C_DIM, "verbose:"), text);
                 }
 
-                println!("{} {}",
-                    style!(C_CYAN, "\u{2502}"),
-                    style!(C_DIM, "\u{23f1} {:.1}s", elapsed.as_secs_f64()));
+                let cleaned = text.trim().to_string();
 
-                let code = extract_code_block(&text);
-                let files = extract_code_blocks_with_names(&text);
+                if intent == TaskIntent::CodeAction {
+                    let code = extract_code_block(&cleaned);
+                    let files = extract_code_blocks_with_names(&cleaned);
 
-                if !files.is_empty() {
-                    session.last_files = files.clone();
-                    if !code.is_empty() {
+                    if !files.is_empty() {
+                        session.last_files = files.clone();
+                        if !code.is_empty() {
+                            session.last_code = code;
+                        }
+                        println!("{}", style!(C_CYAN, "│"));
+                        println!("{} {} {}",
+                            style!(C_CYAN, "│"),
+                            style!(C_GREEN, "generated:"),
+                            style!(C_WHITE_B, "{} file(s)", files.len()));
+                        for f in &files {
+                            let icon = file_icon(&f.path);
+                            if f.path.is_empty() {
+                                println!("{}   {} unnamed ({} bytes)", style!(C_CYAN, "│"), icon, f.content.len());
+                            } else {
+                                println!("{}   {} {} ({} bytes)",
+                                    style!(C_CYAN, "│"), icon,
+                                    style!(C_WHITE_B, "{}", f.path), f.content.len());
+                            }
+                        }
+                        println!("{}", style!(C_CYAN, "│"));
+
+                        auto_write_files(&mut session, &files);
+                    } else if !code.is_empty() {
                         session.last_code = code;
+                        session.last_files.clear();
+                        println!("{}", style!(C_CYAN, "│"));
+                        println!("{} {}",
+                            style!(C_CYAN, "│"),
+                            style!(C_GREEN, "detected code block — use /write <path> to save"));
+                        println!("{}", style!(C_CYAN, "│"));
+                    } else {
+                        println!("{} {}",
+                            style!(C_CYAN, "│"),
+                            style!(C_DIM, "\u{23f1} {:.1}s", elapsed.as_secs_f64()));
                     }
-                    println!("{}", style!(C_CYAN, "│"));
-                    println!("{} {} {}",
-                        style!(C_CYAN, "│"),
-                        style!(C_GREEN, "generated:"),
-                        style!(C_WHITE_B, "{} file(s)", files.len()));
-                    for f in &files {
-                        let icon = file_icon(&f.path);
-                        if f.path.is_empty() {
-                            println!("{}   {} unnamed ({} bytes)", style!(C_CYAN, "│"), icon, f.content.len());
-                        } else {
-                            println!("{}   {} {} ({} bytes)",
-                                style!(C_CYAN, "│"), icon,
-                                style!(C_WHITE_B, "{}", f.path), f.content.len());
+                } else {
+                    // FastAnswer, Planning, WebNeeded — print CLEAN response
+                    if cleaned.is_empty() {
+                        println!("{} {}",
+                            style!(C_YELLOW, "│"),
+                            style!(C_DIM, "(empty response)"));
+                    } else {
+                        println!("{} {}",
+                            style!(C_CYAN, "│"),
+                            style!(C_DIM, "\u{23f1} {:.1}s", elapsed.as_secs_f64()));
+                        for line in cleaned.lines() {
+                            println!("{} {}", style!(C_CYAN, "│"), line);
                         }
                     }
-                    println!("{}", style!(C_CYAN, "│"));
-
-                    auto_write_files(&mut session, &files);
-                } else if !code.is_empty() {
-                    session.last_code = code;
-                    session.last_files.clear();
                 }
 
-                if !text.trim().is_empty() {
-                    session.history.push((trimmed.to_string(), text));
+                if !cleaned.is_empty() {
+                    session.history.push((trimmed.to_string(), cleaned));
                     if session.history.len() > 12 {
                         session.history.remove(0);
                     }
@@ -1025,8 +1059,9 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
                 println!("{}", style!(C_DIM, "│"));
             }
             Err(e) => {
-                println!();
+                println!("{}", style!(C_DIM, "\u{23f1} {:.1}s", elapsed.as_secs_f64()));
                 eprintln!("  {} {}", style!(C_RED, "err:"), e);
+                println!("{}", style!(C_DIM, "│"));
             }
         }
     }
@@ -1035,7 +1070,17 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
 
 fn has_creation_intent(input: &str) -> bool {
     let lower = input.to_lowercase();
-    let creation_words = ["create", "build", "make", "generate", "write", "scaffold", "set up"];
+    let creation_words = [
+        "create a", "create me a", "create an",
+        "build a", "build me a", "build an",
+        "generate a", "generate me a",
+        "scaffold a", "spin up a",
+        "write a", "write me a", "code a",
+        "make a file", "make a component", "make a project",
+        "make a website", "make a script", "make an app", "make a page",
+        "make me a file", "make me a component", "make me a website",
+        "make me a script", "make me an app",
+    ];
     creation_words.iter().any(|w| lower.contains(w))
 }
 
@@ -1045,6 +1090,82 @@ fn has_file_path(input: &str) -> bool {
         || lower.contains('/') || lower.contains(".ts") || lower.contains("file")
         || lower.contains("path") || lower.contains("directory") || lower.contains("folder")
         || lower.contains("into ") || lower.contains("in ")
+}
+
+#[derive(Debug, PartialEq)]
+enum TaskIntent {
+    FastAnswer,
+    Planning,
+    WebNeeded,
+    CodeAction,
+}
+
+fn classify_intent(input: &str) -> TaskIntent {
+    let lower = input.to_lowercase();
+
+    let web_explicit = lower.contains("search the web")
+        || lower.contains("search online")
+        || lower.contains("latest version")
+        || lower.contains("latest release")
+        || lower.contains("npm package")
+        || lower.contains("pip install")
+        || lower.contains("api docs")
+        || lower.contains("api documentation")
+        || lower.contains("stripe api")
+        || lower.contains("github repo")
+        || lower.contains("browse http")
+        || lower.contains("stack overflow")
+        || lower.contains("look up the")
+        || lower.contains("on the internet");
+
+    if web_explicit {
+        return TaskIntent::WebNeeded;
+    }
+
+    let plan_indicators = lower.contains("how would you")
+        || lower.contains("how should i")
+        || lower.contains("what's the best way")
+        || lower.contains("what is the best way")
+        || lower.contains("suggest an approach")
+        || lower.contains("suggest a strategy")
+        || lower.contains("design a system")
+        || lower.contains("what are the trade")
+        || lower.contains("should i use")
+        || lower.contains("would you recommend")
+        || lower.contains("is it better to")
+        || (lower.contains("how to") && lower.contains("implement"))
+        || (lower.contains("how to") && lower.contains("architect"))
+        || (lower.contains("how to") && lower.contains("design"))
+        || (lower.contains("how to") && lower.contains("structure"));
+
+    if plan_indicators && !has_creation_intent(input) {
+        return TaskIntent::Planning;
+    }
+
+    if has_creation_intent(input) {
+        return TaskIntent::CodeAction;
+    }
+
+    let fix_indicators = lower.starts_with("fix ")
+        || lower.starts_with("refactor ")
+        || lower.starts_with("rename ")
+        || lower.starts_with("delete ")
+        || lower.starts_with("optimize ")
+        || lower.starts_with("update ");
+    if fix_indicators {
+        return TaskIntent::CodeAction;
+    }
+
+    TaskIntent::FastAnswer
+}
+
+fn intent_instruction(intent: &TaskIntent) -> &'static str {
+    match intent {
+        TaskIntent::FastAnswer => "\n\n[ANSWER CONCISELY — no code generation, no file format. Just a clear text response.]",
+        TaskIntent::Planning => "\n\n[PLAN FIRST — do NOT generate code. Give alternatives, trade-offs, and a recommendation. The user will tell you when to start coding.]",
+        TaskIntent::WebNeeded => "\n\n[WEB SEARCH NEEDED — tell the user to run /search <query> to get current info before you can answer accurately.]",
+        TaskIntent::CodeAction => "\n\n[USER WANTS CODE — follow the multi-file format rules to generate complete, runnable files.]",
+    }
 }
 
 fn prompt_for_path(session: &mut ChatSession) -> io::Result<String> {

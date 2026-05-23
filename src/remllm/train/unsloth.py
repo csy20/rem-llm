@@ -88,8 +88,10 @@ def train_unsloth(config_path: Path) -> None:
             logging_steps=10,
             evaluation_strategy="epoch",
             save_strategy="epoch",
-            bf16=True,
-            fp16=False,
+            bf16=torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 8,
+            fp16=torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] < 8,
             optim="paged_adamw_8bit",
             report_to="none",
             seed=int(config["project"]["seed"]),

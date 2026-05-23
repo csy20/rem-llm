@@ -49,13 +49,17 @@ def prepare_data(config_path: Path, force: bool = False) -> None:
     cleaned_rows, dropped = validate_rows(raw_rows)
 
     random.Random(seed).shuffle(cleaned_rows)
+    if len(cleaned_rows) < 2:
+        raise ValueError(
+            f"Need at least 2 valid rows for train/val split, got {len(cleaned_rows)}"
+        )
     split_idx = max(1, int(len(cleaned_rows) * train_split))
     split_idx = min(split_idx, len(cleaned_rows) - 1)
 
     train_rows = cleaned_rows[:split_idx]
     val_rows = cleaned_rows[split_idx:]
 
-    eval_size = min(max(1, len(val_rows)), 200)
+    eval_size = min(max(1, int(len(cleaned_rows) * 0.05)), 200)
     eval_rows = val_rows[:eval_size]
 
     write_jsonl(train_path, train_rows)

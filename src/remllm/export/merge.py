@@ -12,7 +12,7 @@ def merge_adapter(config_path: Path) -> None:
         from peft import PeftModel
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
-        raise SystemExit(
+        raise RuntimeError(
             "Missing dependencies for merging. Install with:\n"
             "pip install torch transformers peft"
         ) from exc
@@ -27,13 +27,14 @@ def merge_adapter(config_path: Path) -> None:
     merged_dir.mkdir(parents=True, exist_ok=True)
 
     if not adapter_dir.exists():
-        raise SystemExit(f"Adapter directory not found: {adapter_dir}")
+        raise FileNotFoundError(f"Adapter directory not found: {adapter_dir}")
 
     print(f"Loading base model: {base_name}")
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     base_model = AutoModelForCausalLM.from_pretrained(
         base_name,
-        torch_dtype=torch.float16,
-        device_map="auto",
+        torch_dtype=torch_dtype,
+        device_map="auto" if torch.cuda.is_available() else None,
     )
     tokenizer = AutoTokenizer.from_pretrained(base_name)
 

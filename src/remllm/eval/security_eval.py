@@ -37,7 +37,7 @@ AUTH_PATTERNS = [
         r"console\.(?:log|warn|error)\s*\(.*(?:password|token|secret|credential)",
         "leaked_secret_logging",
     ),
-    (r"\.use\s*\(\s*(?:app|router)\s*(?!.*auth)", "missing_auth_middleware"),
+    (r"\.use\s*\(\s*(?:app|router)\s*(?!.{0,200}auth)", "missing_auth_middleware"),
 ]
 
 INSECURE_CONFIG_PATTERNS = [

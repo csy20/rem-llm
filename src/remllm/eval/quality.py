@@ -22,7 +22,7 @@ def detect_language(row: dict) -> str:
         return "javascript"
     if "sql" in text or "select " in text:
         return "sql"
-    if "go" in text or "func " in text:
+    if re.search(r"(?:func\s+\w+\s*\(|package\s+main\b)", text):
         return "go"
     if "rust" in text or "fn " in text:
         return "rust"
@@ -129,10 +129,10 @@ def run_prompt_ollama(
     model_name: str, prompt: str, timeout_s: Optional[int] = None
 ) -> str:
     import subprocess
+    from typing import Any
 
-    kwargs = {"capture_output": True, "text": True, "check": False}
-    if timeout_s:
-        kwargs["timeout"] = timeout_s
+    kwargs: dict[str, Any] = {"capture_output": True, "text": True, "check": False}
+    kwargs["timeout"] = timeout_s if timeout_s else 300
 
     result = subprocess.run(["ollama", "run", model_name, prompt], **kwargs)
     if result.returncode != 0:

@@ -5,10 +5,13 @@ No GPU required — uses CPU-friendly sentence-transformers or Ollama embeddings
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -54,6 +57,9 @@ class CodebaseIndexer:
             try:
                 chunk.embedding = self._embed_text(chunk.content)
             except Exception:
+                _logger.warning(
+                    "Failed to embed chunk %s from %s", chunk.name, file_path
+                )
                 chunk.embedding = None
             chunks.append(chunk)
 
@@ -263,7 +269,6 @@ class CodebaseIndexer:
         return "\n".join(block_lines)
 
     def _embed_text(self, text: str) -> list[float]:
-        import hashlib
         import struct
 
         hash_bytes = hashlib.sha256(text.encode("utf-8")).digest()
@@ -325,6 +330,7 @@ class CodebaseIndexer:
             try:
                 self.chunks.extend(self._chunk_file(file_path))
             except Exception:
+                _logger.warning("Failed to chunk file: %s", file_path)
                 continue
 
         self._save()

@@ -1,11 +1,16 @@
 """Adaptive thinking router — fast pre-classification for tool-use decisions.
 
-STRICT rules — never assumes. Only triggers tools when the developer explicitly asks:
-  - WEB: only when user asks for specific external info (docs, latest version, registry)
-  - FILE_CREATE: only direct imperative commands (create/build/make/write/generate)
-  - FILE_MODIFY: only direct imperative (fix/refactor/update/rename)
-  - PLAN_ONLY: design/architecture questions → think first, don't build yet
-  - fast_path: everything else gets a direct answer, no tools, no code
+Multi-level decision engine:
+  LEVEL 0 — Hard regex pre-filter (microsecond speed):
+    - Catches UNQUESTIONABLE chat/greetings/simple questions → fast_path
+    - Catches CLEAR file/code operations → tool route
+    - Ambiguous inputs fall through to Level 1 (LLM classifier)
+
+  LEVEL 1 — LLM-based classifier (see classifier.py):
+    - For ambiguous inputs, ask the LLM to classify intent
+    - Returns CHAT | CODE_CREATE | CODE_MODIFY | WEB_SEARCH | PLAN
+
+  Rules are conservative: when in doubt, default to chat (safe default).
 """
 
 from __future__ import annotations
@@ -37,9 +42,21 @@ class TaskProfile:
     task_category: str = "general"
     fast_path: bool = False
     reasoning: str = ""
+    needs_llm_classification: bool = False
 
     def needs(self, tool: ToolNeed) -> bool:
         return tool in self.tool_needs
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "needs_tools": self.needs_tools,
+            "tool_needs": [t.name for t in self.tool_needs],
+            "confidence": self.confidence,
+            "task_category": self.task_category,
+            "fast_path": self.fast_path,
+            "reasoning": self.reasoning,
+            "needs_llm_classification": self.needs_llm_classification,
+        }
 
 
 def _compile_all(patterns: list[str]) -> list[re.Pattern[str]]:
@@ -47,9 +64,10 @@ def _compile_all(patterns: list[str]) -> list[re.Pattern[str]]:
 
 
 class AdaptiveRouter:
-    """Strict regex classifier — tools fire only on explicit developer commands.
+    """Multi-level router: regex Level-0 gate → LLM Level-1 classifier.
 
-    No I/O, no embedding, runs in microseconds. All patterns pre-compiled.
+    Level 0 catches obvious cases. Level 1 handles ambiguity.
+    When confidence is < 0.85, recommends LLM re-classification.
     """
 
     _PATTERN_WEB: ClassVar[list[str]] = [
@@ -111,15 +129,22 @@ class AdaptiveRouter:
     ]
 
     _PATTERN_FAST_PATH: ClassVar[list[str]] = [
+        r"^[^a-z0-9]*\s*(?:hi+|hey+|hello+|yo+|sup|howdy|greetings|good\s+(?:morning|afternoon|evening)|h[ae]llo|helo|hii+|heya|heyy+|yo)\b",
         r"^(?:what\s+is|explain|describe|tell\s+me\s+about|how\s+does)\b",
-        r"^(?:hello|hi|hey|thanks|thank\s+you|ok|okay|yes|no|sure)\b",
-        r"^(?:what\s+does|what's|whats)\s+\w+\s+(?:mean|do|stand\s+for)\b",
-        r"^(?:define|summarize|tldr|recap)\s+",
+        r"^(?:thanks?\s*(?:you|!)?|thank\s*you|thx|ok|okay|sure|yeah|yep|nope|got\s+it|sounds\s+good|cool|nice|awesome|great|perfect|alright)\b",
+        r"^(?:what\s+does|what['\u2019]s|whats)\s+\w+\s+(?:mean|do|stand\s+for)\b",
+        r"^(?:define|summarize|tldr|recap|elaborate)\s+",
         r"^(?:why|when|where|who|whose)\s+(?:is|are|does|did|was|were|do|can|could|should|would|will|shall|may|might)\b",
-        r"^(?:is\s+it|are\s+you|can\s+you|could\s+you|would\s+you)\b(?!\s+(?:create|make|build|write|fix|change|modify|refactor|rename|delete|remove))",
+        r"^(?:is\s+it|are\s+you|can\s+you|could\s+you|would\s+you|will\s+you)\b(?!.*\b(?:create|make|build|write|fix|change|modify|refactor|rename|delete|remove|install|scaffold)\b)",
         r"^(?:should\s+i|which\s+(?:is|one)|what\s+(?:are|is)\s+the\s+)(?:best|better|difference|pros?\s+and\s+cons?)\b",
         r"^(?:can\s+(?:you|i|we)|how\s+(?:do|can|would|should|does))\s+(?:i\s+)?(?:use|call|import|access|read|check|get|set|validate|compare|convert|parse|format|debug|test|deploy|configure|setup)\b",
         r"^(?:is\s+there|are\s+there|does\s+(?:.+)exist|do\s+(?:.+)support)\b",
+        r"^(?:am\s+i|should\s+i)\s+(?:doing|using|following|on\s+track|correct|right|wrong)\b",
+        r"^(?:thank|thanks|thx|much\s+appreciated|appreciate\s+it|cheers)\s*[!.]*$",
+    ]
+
+    _PATTERN_FAQ_NEGATION: ClassVar[list[str]] = [
+        r"\b(?:how\s+(?:do|can|would|should|does|to)|explain|what\s+(?:is|are|does|do)|why\s+(?:is|are|does|do)|tell\s+me|describe)\b",
     ]
 
     _PATTERN_TEST: ClassVar[list[str]] = [
@@ -135,6 +160,7 @@ class AdaptiveRouter:
     _CODEBASE: ClassVar[list[re.Pattern[str]]] = _compile_all(_PATTERN_CODEBASE)
     _SHELL: ClassVar[list[re.Pattern[str]]] = _compile_all(_PATTERN_SHELL)
     _FAST_PATH: ClassVar[list[re.Pattern[str]]] = _compile_all(_PATTERN_FAST_PATH)
+    _FAQ_NEGATION: ClassVar[list[re.Pattern[str]]] = _compile_all(_PATTERN_FAQ_NEGATION)
     _TEST: ClassVar[list[re.Pattern[str]]] = _compile_all(_PATTERN_TEST)
 
     def classify(self, task: str) -> TaskProfile:
@@ -149,6 +175,12 @@ class AdaptiveRouter:
         codebase = self._matches_any(tl, self._CODEBASE)
         shell = self._matches_any(tl, self._SHELL)
         test = self._matches_any(tl, self._TEST)
+        is_faq = self._matches_any(tl, self._FAQ_NEGATION)
+
+        if is_faq and create:
+            create = False
+        if is_faq and modify:
+            modify = False
 
         has_code_action = create or modify
         has_action = has_code_action or shell or test
@@ -156,6 +188,7 @@ class AdaptiveRouter:
         if fast and not has_action and not web and not codebase and not plan:
             profile.fast_path = True
             profile.task_category = "question"
+            profile.confidence = 0.98
             profile.reasoning = "simple Q&A — direct answer"
             return profile
 
@@ -187,25 +220,28 @@ class AdaptiveRouter:
 
         if web and create:
             profile.task_category = "research_and_create"
-            profile.confidence = 0.80
+            profile.confidence = 0.78
         elif create and not modify and not web:
             profile.task_category = "code_generation"
-            profile.confidence = 0.93
+            profile.confidence = 0.91
         elif modify and not create:
             profile.task_category = "code_edit"
-            profile.confidence = 0.92
+            profile.confidence = 0.90
         elif web and not has_code_action:
             profile.task_category = "research"
-            profile.confidence = 0.88
+            profile.confidence = 0.86
         elif shell and not has_code_action and not web:
             profile.task_category = "command"
-            profile.confidence = 0.92
+            profile.confidence = 0.90
         elif codebase and not has_code_action:
             profile.task_category = "exploration"
-            profile.confidence = 0.90
+            profile.confidence = 0.88
         else:
             profile.task_category = "mixed"
-            profile.confidence = 0.75
+            profile.confidence = 0.70
+
+        if profile.confidence < 0.85:
+            profile.needs_llm_classification = True
 
         profile.reasoning = self._reasoning(profile)
         return profile
@@ -249,21 +285,38 @@ def build_adaptive_prompt(
     if profile is None:
         profile = classify_task(task)
 
-    parts: list[str] = ["You are a coding assistant. Think carefully before acting."]
+    parts: list[str] = [
+        "You are REM, a helpful and precise coding assistant. "
+        "You can chat conversationally or generate code files — "
+        "choose based on what the user is asking for."
+    ]
 
     if profile.fast_path:
         parts.append(
-            "\nThis is a simple question. Answer concisely with no code generation, "
-            "no tools, and no JSON — just a direct text answer."
+            "\n[MODE: CHAT] This is conversation or a question. "
+            "Reply with a clear, direct text/markdown answer. "
+            "NO code generation, NO file creation, NO JSON, NO tools. "
+            "If the user might want code, ask them first: "
+            '"Would you like me to write code for that?"'
         )
-        return "\n".join(parts) + f"\n\nQ: {task}\nA:"
+        parts.append(f"\nUser: {task}")
+        return "\n".join(parts)
+
+    if profile.needs_llm_classification and not profile.fast_path:
+        parts.append(
+            "\n[ATTENTION] The intent of this request is ambiguous. "
+            "If this is a question or conversation (NOT a code/edit request), "
+            "answer directly in text. If this IS a code request, follow the "
+            "JSON schema below. When in doubt, answer as text."
+        )
 
     if profile.task_category == "planning":
         if codebase_context:
             parts.append(f"\nRelevant codebase context:\n{codebase_context}")
         parts.append(
-            "\nThis is a design/architecture question. Do NOT generate code — instead, "
-            "produce a clear plan with trade-offs, alternatives, and recommendations. "
+            "\n[MODE: PLAN] This is a design/architecture question. "
+            "Do NOT generate code — instead, produce a clear plan with "
+            "trade-offs, alternatives, and recommendations. "
             "Respond in this JSON format:\n```json\n"
             '{\n  "plan": "Step-by-step approach with rationale",\n'
             '  "alternatives": ["Option B with trade-offs", "Option C with trade-offs"],\n'
@@ -297,18 +350,18 @@ def build_adaptive_prompt(
         )
 
     if codebase:
-        tool_calls = json_schema.get("tool_calls")
-        if tool_calls is None:
+        tool_calls_list = json_schema.get("tool_calls")
+        if tool_calls_list is None:
             json_schema["tool_calls"] = [
                 {"name": "codebase_search", "arguments": {"query": "what to find"}}
             ]
         else:
-            json_schema["tool_calls"] = list(tool_calls) + [
+            json_schema["tool_calls"] = list(tool_calls_list) + [
                 {"name": "codebase_search", "arguments": {"query": "what to find"}}
             ]
 
     if create or modify:
-        ops: list[dict[str, str]] = []
+        ops: list[dict[str, Any]] = []
         if create and modify:
             ops = [
                 {
@@ -353,7 +406,8 @@ def build_adaptive_prompt(
         ]
 
     parts.append(
-        "\nRespond with ONLY this JSON structure:\n```json\n"
+        "\n[MODE: CODE] Generate code/files. "
+        "Respond with ONLY this JSON structure:\n```json\n"
         + _json_str(json_schema)
         + "\n```\n"
     )

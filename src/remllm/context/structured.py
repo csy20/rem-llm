@@ -4,6 +4,11 @@ Supports multi-file code generation and edit operations with a JSON schema
 that can be used for prompt engineering and evaluation.
 
 Integrates with the adaptive router for fast tool-use pre-classification.
+
+Dual-mode architecture:
+  - CHAT mode: plain text/markdown responses for conversation/questions
+  - CODE mode: structured JSON output for file creation/modification
+  The system intelligently selects the right mode based on user intent.
 """
 
 import json
@@ -150,7 +155,15 @@ class StructuredOutput:
         return results
 
 
+PROMPT_CHAT_BASE = """[MODE: CHAT]
+You are REM, a helpful coding assistant in conversation mode.
+Reply with plain text or markdown. NO code generation, NO file creation, NO JSON output.
+Be concise and direct. If the user might want code, ask them first:
+"Would you like me to write code for that?"
+""".strip()
+
 PROMPT_GENERAL = """
+[MODE: CODE — GENERAL]
 Respond in JSON:
 ```json
 {
@@ -180,6 +193,7 @@ Action types:
 """.strip()
 
 PROMPT_CREATE_ONLY = """
+[MODE: CODE — CREATE]
 You need to CREATE new files. Output in JSON:
 ```json
 {
@@ -193,6 +207,7 @@ You need to CREATE new files. Output in JSON:
 ```
 """
 PROMPT_MODIFY_ONLY = """
+[MODE: CODE — MODIFY]
 You need to MODIFY existing files. Output full file content in JSON:
 ```json
 {
@@ -206,6 +221,7 @@ You need to MODIFY existing files. Output full file content in JSON:
 """
 
 PROMPT_WEB_SEARCH = """
+[MODE: WEB SEARCH]
 You need external knowledge (documentation, API references, how-to). Start by defining what to search:
 ```json
 {
@@ -219,10 +235,12 @@ You need external knowledge (documentation, API references, how-to). Start by de
 """
 
 PROMPT_FAST = """
+[MODE: CHAT — FAST]
 Answer concisely and directly. No tools or code generation needed.
 """.strip()
 
 PROMPT_CODEBASE = """
+[MODE: CODEBASE SEARCH]
 You need to search the existing codebase before responding. First request a codebase search:
 ```json
 {
@@ -261,8 +279,10 @@ def _build_adaptive_prompt(
     from remllm.context.adaptive import ToolNeed
 
     if profile.fast_path:
-        prompt = PROMPT_FAST
-        prompt += f"\n\nTask: {task}"
+        prompt = PROMPT_CHAT_BASE
+        prompt += f"\n\nUser: {task}"
+        if codebase_context:
+            prompt += f"\n\nRelevant codebase context:\n{codebase_context}"
         return prompt
 
     needs_web = profile.needs(ToolNeed.WEB_SEARCH)
@@ -280,6 +300,14 @@ def _build_adaptive_prompt(
         prompt = PROMPT_CODEBASE
     else:
         prompt = PROMPT_GENERAL
+
+    if profile.needs_llm_classification and not profile.fast_path:
+        prefix = (
+            "[ATTENTION] The intent of this request is ambiguous. "
+            "If this is a question/conversation, answer in text. "
+            "Only generate code/files if the user clearly asked for them.\n\n"
+        )
+        prompt = prefix + prompt
 
     if codebase_context:
         prompt = (

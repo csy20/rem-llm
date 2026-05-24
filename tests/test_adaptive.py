@@ -253,9 +253,9 @@ class TestTaskProfile:
 class TestBuildAdaptivePrompt:
     def test_fast_path_prompt(self):
         prompt = build_adaptive_prompt("what is a closure?")
-        assert "Answer concisely" in prompt
-        assert "Q:" in prompt
-        assert "code generation" in prompt.lower()
+        assert "MODE: CHAT" in prompt
+        assert "User:" in prompt
+        assert "NO code generation" in prompt
 
     def test_create_prompt(self):
         prompt = build_adaptive_prompt("create a React component called Navbar")
@@ -293,7 +293,7 @@ class TestBuildAdaptivePrompt:
     def test_with_profile_override(self):
         p = classify_task("what is a hook in React?")
         prompt = build_adaptive_prompt("create a custom hook", profile=p)
-        assert "Answer concisely" in prompt
+        assert "MODE: CHAT" in prompt
 
 
 class TestClassifyTaskConvenience:

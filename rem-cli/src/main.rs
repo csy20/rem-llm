@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -14,6 +14,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use futures_util::StreamExt;
 use walkdir::WalkDir;
+
+mod feedback;
+use feedback::FeedbackTracker;
+
+static CTRL_C_COUNT: AtomicU8 = AtomicU8::new(0);
+
+fn setup_global_ctrlc_handler() {
+    let _ = tokio::spawn(async {
+        loop {
+            let _ = tokio::signal::ctrl_c().await;
+            let count = CTRL_C_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+            if count >= 2 {
+                eprintln!("\n  {} exiting (Ctrl+C pressed twice)", "\u{00d7}");
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+fn reset_ctrlc_count() {
+    CTRL_C_COUNT.store(0, Ordering::SeqCst);
+}
 
 // ── ANSI styling ───────────────────────────────────────────────────────────
 
@@ -36,33 +58,43 @@ macro_rules! style {
 
 // ── Config & Prompts ───────────────────────────────────────────────────────
 
-const DEFAULT_SYSTEM_PROMPT: &str = r##"You are REM, a beginner-friendly coding assistant.
-Focus on HTML, CSS, JS, and safe terminal basics.
+const DEFAULT_SYSTEM_PROMPT: &str = r##"You are REM, a helpful coding assistant for developers of all levels.
 
-Rules:
-- Always return strict JSON with keys: explanation, code, files, commands, checks, caution.
-- The "files" array allows you to return MULTIPLE files in one response. Each entry has "path" (relative filepath) and "content" (full file content). Use this whenever the user wants more than one file (e.g. index.html + style.css + script.js). When only one file is needed, you may still use "files" or put the content in "code".
-- "code" is a single code block (legacy). Prefer "files" for multi-file output.
-- commands must be safe for beginners — never suggest sudo, rm -rf, or pipes to bash.
-- If a command could be dangerous, flag it in the caution field.
-- Keep explanations short and clear.
-- Prefer complete, runnable examples.
+You can chat conversationally OR generate code/files — choose the right mode based on what the user is asking for.
+
+CHAT mode (default):
+- User is asking a question, explaining something, greeting you, or having a conversation.
+- Reply with a clear, direct text or markdown answer.
+- NO code generation, NO file creation, NO JSON. Just answer the question.
+- If the user might want code but it's not explicit, ask first: "Would you like me to write code for that?"
+
+CODE mode:
+- User has explicitly asked you to create, build, generate, scaffold, fix, refactor, or modify code/files.
+- Generate complete, runnable files with clear file paths.
+- Use the [MODE: CODE] marker at the start of your response when generating code.
 "##;
 
-const CHAT_SYSTEM_PROMPT_CONVERSATIONAL: &str = r##"You are REM, a fast and helpful coding assistant.
+const CHAT_SYSTEM_PROMPT_CONVERSATIONAL: &str = r##"You are REM, a helpful coding assistant in conversation mode.
 
+[MODE: CHAT]
 RULES — follow strictly:
-1. Answer concisely in plain text or markdown. No code generation unless explicitly asked.
-2. If the user asks "how would you...", "what's the best way...", "should I use X or Y" — give a plan with trade-offs, but NO code.
-3. If you need current info (versions, docs), briefly suggest: "/search <query>". Never guess.
-4. Keep it short. The user is a developer.
+1. The user is chatting, asking a question, greeting you, or making conversation.
+2. Reply with a clear, direct text or markdown answer. BE CONCISE.
+3. NO code generation. NO file creation. NO multi-file format. NO JSON.
+4. If the user might want code but didn't explicitly ask, ASK FIRST: "Would you like me to write code for that?"
+5. If the user asks "how would you...", "what's the best way...", "should I use X or Y" — give a plan with trade-offs, but NO code.
+6. If you need current info (versions, docs), briefly suggest: "/search <query>". Never guess.
+7. Keep it short. The user is a developer.
 "##;
 
-const CHAT_SYSTEM_PROMPT_CODE: &str = r##"You are REM, a fast and helpful coding assistant.
+const CHAT_SYSTEM_PROMPT_CODE: &str = r##"You are REM, a coding assistant in code generation mode.
 
+[MODE: CODE]
 RULES — follow strictly:
-1. The user explicitly asked for code. Generate complete, runnable files using the multi-file format below.
-2. Keep explanations minimal. Focus on working code.
+1. The user explicitly asked for code. Generate complete, runnable files.
+2. First, give a 1-line summary of what you'll create.
+3. Then output files using the multi-file format below.
+4. Keep explanations minimal. Focus on working code.
 
 === MULTI-FILE FORMAT ===
 Each file MUST have its own ### heading with the full path, then a code fence.
@@ -77,7 +109,7 @@ Each file MUST have its own ### heading with the full path, then a code fence.
 <file content here>
 ```
 
-Always provide complete, runnable code.
+Always provide complete, runnable code. Do NOT use JSON format — use the multi-file format above.
 "##;
 
 const BLOCKED_COMMAND_PATTERNS: [&str; 10] = [
@@ -91,7 +123,7 @@ const BLOCKED_COMMAND_PATTERNS: [&str; 10] = [
 #[command(
     name = "rem",
     version,
-    about = "REM — Beginner-friendly coding assistant for HTML, CSS, and terminal basics",
+    about = "REM — Coding assistant CLI. Run `rem` to start interactive chat. Type /mode to toggle CHAT ↔ CODE.",
     long_about = None,
 )]
 struct Cli {
@@ -102,19 +134,17 @@ struct Cli {
     #[arg(long, short = 'v', global = true, help = "Verbose output (show raw model responses)")]
     verbose: bool,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    #[command(about = "Ask REM a coding question")]
+    #[command(about = "Ask REM a coding question (single-shot)")]
     Ask(AskArgs),
     #[command(about = "Explain a terminal command safely")]
     Explain(ExplainArgs),
     #[command(about = "Preview a patch for a file")]
     Patch(PatchArgs),
-    #[command(about = "Start an interactive chat session")]
-    Chat,
     #[command(about = "Scaffold a new project with templates")]
     New(NewArgs),
 }
@@ -336,18 +366,18 @@ fn guess_filename(lines: &[&str]) -> String {
         if trimmed.starts_with("<!DOCTYPE") || trimmed.starts_with("<html") || trimmed.contains("<head") {
             return "index.html".to_string();
         }
-        if trimmed.starts_with("body ") || trimmed.starts_with(".") || trimmed.starts_with("#")
-            || trimmed.starts_with("@media") || trimmed.starts_with(":root")
-            || trimmed.contains("{") && trimmed.contains("}") && !trimmed.contains("function")
-        {
-            return "style.css".to_string();
-        }
         if trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("var ")
             || trimmed.starts_with("function ") || trimmed.starts_with("document.")
             || trimmed.starts_with("import ") || trimmed.starts_with("export ")
             || trimmed.starts_with("fetch(") || trimmed.starts_with("addEventListener")
         {
             return "script.js".to_string();
+        }
+        if trimmed.starts_with("body ") || trimmed.starts_with(".") || trimmed.starts_with("#")
+            || trimmed.starts_with("@media") || trimmed.starts_with(":root")
+            || (trimmed.contains("{") && trimmed.contains("}") && !trimmed.contains("function"))
+        {
+            return "style.css".to_string();
         }
     }
     String::new()
@@ -417,6 +447,11 @@ impl OllamaClient {
             "model": self.model,
             "prompt": final_prompt,
             "stream": false,
+            "options": {
+                "num_predict": 512,
+                "num_ctx": 2048,
+                "num_thread": 4
+            },
             "format": {
                 "type": "object",
                 "properties": {
@@ -446,7 +481,7 @@ impl OllamaClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.unwrap_or_else(|e| format!("(read error: {})", e));
             let err_msg = serde_json::from_str::<OllamaErrorResponse>(&body)
                 .map(|v| v.error).unwrap_or_else(|_| body.clone());
             if status.as_u16() == 404 && err_msg.to_lowercase().contains("model") {
@@ -483,13 +518,18 @@ impl OllamaClient {
         let payload = json!({
             "model": self.model,
             "prompt": final_prompt,
-            "stream": true
+            "stream": true,
+            "options": {
+                "num_predict": 512,
+                "num_ctx": 2048,
+                "num_thread": 4
+            }
         });
         let resp = self.client.post(&url).json(&payload).send().await
             .context("failed to call Ollama")?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.unwrap_or_else(|e| format!("(read error: {})", e));
             let err_msg = serde_json::from_str::<OllamaErrorResponse>(&body)
                 .map(|v| v.error).unwrap_or_else(|_| body.clone());
             if status.as_u16() == 404 && err_msg.to_lowercase().contains("model") {
@@ -497,12 +537,48 @@ impl OllamaClient {
             }
             return Err(anyhow!("Ollama failed: {} — {}", status, err_msg));
         }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_clone = cancelled.clone();
+        let ctrlc_task = tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            cancelled_clone.store(true, Ordering::SeqCst);
+        });
+
+        let result = self.stream_response(resp, cancelled.clone(), ctrlc_task).await;
+        if cancelled.load(Ordering::SeqCst) {
+            println!();
+        }
+        result
+    }
+
+    async fn stream_response(
+        &self,
+        resp: reqwest::Response,
+        cancelled: Arc<AtomicBool>,
+        ctrlc_task: tokio::task::JoinHandle<()>,
+    ) -> Result<String> {
         let mut stream = resp.bytes_stream();
         let mut full = String::new();
         let mut buf = String::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("stream read error")?;
+        let start = std::time::Instant::now();
+        let mut token_count = 0u32;
+        'stream_loop: while let Some(chunk) = stream.next().await {
+            if cancelled.load(Ordering::SeqCst) {
+                ctrlc_task.abort();
+                break 'stream_loop;
+            }
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    ctrlc_task.abort();
+                    return Err(anyhow!("stream read error: {}", e));
+                }
+            };
             buf.push_str(&String::from_utf8_lossy(&chunk));
+            if buf.len() > 32_000 {
+                ctrlc_task.abort();
+                return Err(anyhow!("response too large ({} bytes buffered)", buf.len()));
+            }
             while let Some(pos) = buf.find('\n') {
                 let line = buf[..pos].to_string();
                 buf = buf[pos + 1..].to_string();
@@ -510,16 +586,35 @@ impl OllamaClient {
                 if trimmed.is_empty() { continue; }
                 if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
                     if let Some(token) = obj["response"].as_str() {
-                        print!("{}", token);
+                        if io::stdout().write_all(token.as_bytes()).is_err() {
+                            ctrlc_task.abort();
+                            break 'stream_loop;
+                        }
                         let _ = io::stdout().flush();
                         full.push_str(token);
+                        token_count += 1;
                     }
                     if obj["done"].as_bool() == Some(true) {
-                        println!();
+                        if cancelled.load(Ordering::SeqCst) {
+                            ctrlc_task.abort();
+                            break 'stream_loop;
+                        }
+                        let elapsed = start.elapsed();
+                        let tps = if elapsed.as_secs_f64() > 0.0 {
+                            token_count as f64 / elapsed.as_secs_f64()
+                        } else { 0.0 };
+                        println!("\n  {} {:.0} tokens/s in {:.1}s",
+                            style!(C_DIM, "\u{2502}"), tps, elapsed.as_secs_f64());
+                        ctrlc_task.abort();
                         return Ok(full);
                     }
                 }
             }
+        }
+        ctrlc_task.abort();
+        if cancelled.load(Ordering::SeqCst) {
+            println!("\n  {} stream cancelled — {} tokens received (Ctrl+C again to exit)",
+                style!(C_YELLOW, "\u{2502}"), token_count);
         }
         println!();
         Ok(full)
@@ -549,8 +644,8 @@ async fn perform_web_search(client: &Client, query: &str) -> Result<Vec<SearchRe
 
 fn parse_ddg_html(html: &str) -> Vec<SearchResult> {
     let mut results = Vec::new();
-    let title_re = Regex::new(r#"class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*)</a>"#).unwrap();
-    let snippet_re = Regex::new(r#"class="result__snippet"[^>]*>([^<]*(?:<[^/>][^>]*>[^<]*</[^>]+>)*[^<]*)</a>"#).unwrap();
+    let title_re = Regex::new(r#"class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*)</a>"#).expect("invalid regex literal");
+    let snippet_re = Regex::new(r#"class="result__snippet"[^>]*>([^<]*(?:<[^/>][^>]*>[^<]*</[^>]+>)*[^<]*)</a>"#).expect("invalid regex literal");
     let mut remaining = html;
     while results.len() < 8 {
         if let Some(cap) = title_re.captures(remaining) {
@@ -576,12 +671,12 @@ fn parse_ddg_html(html: &str) -> Vec<SearchResult> {
 }
 
 fn strip_html(input: &str) -> String {
-    let tag_re = Regex::new(r"<[^>]*>").unwrap();
-    let amp_re = Regex::new(r"&amp;").unwrap();
-    let lt_re = Regex::new(r"&lt;").unwrap();
-    let gt_re = Regex::new(r"&gt;").unwrap();
-    let quot_re = Regex::new(r"&quot;").unwrap();
-    let apos_re = Regex::new(r"&#x27;").unwrap();
+    let tag_re = Regex::new(r"<[^>]*>").expect("invalid regex literal");
+    let amp_re = Regex::new(r"&amp;").expect("invalid regex literal");
+    let lt_re = Regex::new(r"&lt;").expect("invalid regex literal");
+    let gt_re = Regex::new(r"&gt;").expect("invalid regex literal");
+    let quot_re = Regex::new(r"&quot;").expect("invalid regex literal");
+    let apos_re = Regex::new(r"&#x27;").expect("invalid regex literal");
     let mut s = tag_re.replace_all(input, "").to_string();
     s = amp_re.replace_all(&s, "&").to_string();
     s = lt_re.replace_all(&s, "<").to_string();
@@ -615,12 +710,16 @@ struct ChatSession {
     last_files: Vec<FileEntry>,
     last_files_written: Vec<PathBuf>,
     last_search: Vec<SearchResult>,
+    last_intent: TaskIntent,
+    last_user_input: String,
     project_dir: Option<PathBuf>,
     history: Vec<(String, String)>,
+    feedback: FeedbackTracker,
+    mode: RunMode,
 }
 
 impl ChatSession {
-    fn new() -> Result<Self> {
+    fn new(model: &str) -> Result<Self> {
         let rl = DefaultEditor::new().context("failed to start line editor")?;
         Ok(Self {
             rl,
@@ -628,8 +727,12 @@ impl ChatSession {
             last_files: Vec::new(),
             last_files_written: Vec::new(),
             last_search: Vec::new(),
+            last_intent: TaskIntent::FastAnswer,
+            last_user_input: String::new(),
             project_dir: None,
             history: Vec::new(),
+            feedback: FeedbackTracker::new(model),
+            mode: RunMode::Chat,
         })
     }
 
@@ -645,11 +748,19 @@ impl ChatSession {
         if self.last_search.is_empty() {
             return String::new();
         }
-        let mut ctx = String::from("\n\n[Web search results — use these when answering]:\n");
-        for (i, r) in self.last_search.iter().enumerate() {
-            ctx.push_str(&format!("{}. {}\n   URL: {}\n   {}\n\n", i + 1, r.title, r.url, r.snippet));
+        let mut ctx = String::from("Web search results:\n");
+        for (i, r) in self.last_search.iter().enumerate().take(3) {
+            ctx.push_str(&format!("{}. {} — {}\n", i + 1, r.title, r.snippet));
         }
         ctx
+    }
+
+    fn build_project_context(&self) -> String {
+        if let Some(ref dir) = self.project_dir {
+            build_project_context(dir, 6000)
+        } else {
+            String::new()
+        }
     }
 
     fn build_chat_history(&self) -> String {
@@ -676,42 +787,82 @@ fn truncate_to_lines(s: &str, max_lines: usize) -> String {
 
 // ── Spinner ────────────────────────────────────────────────────────────────
 
-fn spawn_spinner(msg: &'static str) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    let handle = tokio::spawn(async move {
-        let chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let mut i = 0;
-        while r.load(Ordering::Relaxed) {
-            eprint!("\r  {} {}", style!(C_CYAN, "{}", chars[i]), style!(C_DIM, "{}", msg));
-            let _ = io::stderr().flush();
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-            i = (i + 1) % chars.len();
-        }
-    });
-    (running, handle)
+struct SpinnerGuard {
+    running: Arc<AtomicBool>,
+    handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-async fn clear_spinner(running: Arc<AtomicBool>, handle: tokio::task::JoinHandle<()>) {
-    running.store(false, Ordering::Relaxed);
-    let _ = handle.await;
-    eprint!("\r{}\r", " ".repeat(60));
-    let _ = io::stderr().flush();
+impl SpinnerGuard {
+    fn new(msg: &'static str) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+        let handle = tokio::spawn(async move {
+            let chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut i = 0;
+            while r.load(Ordering::Relaxed) {
+                eprint!("\r  {} {}", style!(C_CYAN, "{}", chars[i]), style!(C_DIM, "{}", msg));
+                let _ = io::stderr().flush();
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                i = (i + 1) % chars.len();
+            }
+        });
+        Self { running, handle: Some(handle) }
+    }
+
+    fn cancel(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+
+impl Drop for SpinnerGuard {
+    fn drop(&mut self) {
+        self.cancel();
+        eprint!("\r{}\r", " ".repeat(60));
+        let _ = io::stderr().flush();
+    }
+}
+
+fn check_system_resources() {
+    let mem_gb = detect_system_ram_gb();
+    if mem_gb > 0 && mem_gb <= 16 {
+        eprintln!("{} {} GB RAM detected — Ollama may be slow on CPU.",
+            style!(C_YELLOW, "│ system:"), mem_gb);
+        eprintln!("{} Try:  OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1 ollama serve",
+            style!(C_DIM, "│"));
+        eprintln!();
+    }
+}
+
+fn detect_system_ram_gb() -> u64 {
+    if let Ok(content) = fs::read_to_string("/proc/meminfo") {
+        for line in content.lines() {
+            if line.starts_with("MemTotal:") {
+                let kb: u64 = line.split_whitespace()
+                    .nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                return kb / 1024 / 1024;
+            }
+        }
+    }
+    0
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    setup_global_ctrlc_handler();
+
     let cli = Cli::parse();
     let verbose = cli.verbose;
 
-    match cli.command {
-        Commands::New(args) => {
-            return run_new(args);
-        }
-        _ => {}
+    if let Some(Commands::New(args)) = cli.command {
+        return run_new(args);
     }
+
+    check_system_resources();
 
     let mut cfg = load_config().unwrap_or_default();
     if let Some(m) = cli.model { cfg.model = m; }
@@ -730,11 +881,11 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Ask(args)    => run_ask(&client, &cfg, args, verbose).await,
-        Commands::Explain(args) => run_explain(&client, args).await,
-        Commands::Patch(args)   => run_patch(&client, &cfg, args).await,
-        Commands::Chat          => run_chat(&client, verbose).await,
-        Commands::New(_)        => unreachable!(),
+        Some(Commands::Ask(args))    => run_ask(&client, &cfg, args, verbose).await,
+        Some(Commands::Explain(args)) => run_explain(&client, args).await,
+        Some(Commands::Patch(args))   => run_patch(&client, &cfg, args).await,
+        Some(Commands::New(_))        => unreachable!(),
+        None                          => run_chat(&client, verbose).await,
     }
 }
 
@@ -786,12 +937,51 @@ async fn run_ask(client: &OllamaClient, cfg: &AppConfig, args: AskArgs, verbose:
     }
     print_banner(client);
 
-    let (spin_flag, spin_handle) = spawn_spinner("thinking...");
-    let reply = client.complete_json(&composed).await;
-    clear_spinner(spin_flag, spin_handle).await;
+    let intent = classify_intent(&composed);
 
-    let reply = reply?;
+    let _spinner = SpinnerGuard::new("thinking...");
+    let result = match intent {
+        TaskIntent::CodeAction => {
+            client.complete_json(&composed).await
+        }
+        _ => {
+            let system_prompt = match intent {
+                TaskIntent::FastAnswer => CHAT_SYSTEM_PROMPT_CONVERSATIONAL,
+                TaskIntent::Planning => CHAT_SYSTEM_PROMPT_CONVERSATIONAL,
+                TaskIntent::WebNeeded => CHAT_SYSTEM_PROMPT_CONVERSATIONAL,
+                TaskIntent::CodeAction => unreachable!(),
+            };
+            let inline_prompt = format!(
+                "{}\n\nUser: {}\n\nREM:",
+                system_prompt, composed
+            );
+            let url = api_url(&cfg.ollama_url, "generate");
+            let payload = json!({
+                "model": &client.model,
+                "prompt": inline_prompt,
+                "stream": false
+            });
+            let resp = client.client.post(&url).json(&payload).send().await
+                .context("failed to call Ollama")?;
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("Ollama error: {}", body));
+            }
+            let raw: OllamaResponse = resp.json().await.context("invalid Ollama response")?;
+            Ok(ModelReply {
+                explanation: raw.response.trim().to_string(),
+                code: String::new(),
+                files: vec![],
+                commands: vec![],
+                checks: vec![],
+                caution: String::new(),
+            })
+        }
+    };
+
+    let reply = result?;
     if verbose {
+        eprintln!("{} raw explanation: {}", style!(C_DIM, "verbose:"), reply.explanation);
         eprintln!("{} raw files: {:?}", style!(C_DIM, "verbose:"), reply.files);
     }
     print_reply(&reply, true);
@@ -802,12 +992,9 @@ async fn run_explain(client: &OllamaClient, args: ExplainArgs) -> Result<()> {
     print_banner(client);
     let prompt = format!("Explain this terminal command for a beginner and suggest a safer variant if needed: {}", args.command);
 
-    let (spin_flag, spin_handle) = spawn_spinner("thinking...");
-    let reply = client.complete_json(&prompt).await;
-    clear_spinner(spin_flag, spin_handle).await;
-
-    let reply = reply?;
-    print_reply(&reply, true);
+    let _spinner = SpinnerGuard::new("thinking...");
+    let reply = client.complete_json(&prompt).await?;
+    print_reply(&reply, false);
     Ok(())
 }
 
@@ -821,11 +1008,8 @@ async fn run_patch(client: &OllamaClient, cfg: &AppConfig, args: PatchArgs) -> R
         args.task, args.file.display(), existing, dir_ctx
     );
 
-    let (spin_flag, spin_handle) = spawn_spinner("thinking...");
-    let reply = client.complete_json(&prompt).await;
-    clear_spinner(spin_flag, spin_handle).await;
-
-    let reply = reply?;
+    let _spinner = SpinnerGuard::new("thinking...");
+    let reply = client.complete_json(&prompt).await?;
     println!("{}", style!(C_CYAN, "Patch preview for {}", args.file.display()));
     print_reply(&reply, true);
     Ok(())
@@ -848,52 +1032,142 @@ fn print_welcome(client: &OllamaClient) {
         style!(C_CYAN, "\u{2551}"));
     println!("{}",
         style!(C_CYAN, "\u{255a}\u{2550}\u{2567}\u{2550}\u{2567}\u{2550}\u{2567}\u{2550}\u{2567}\u{2550}\u{255d}"));
+    println!("{} {} {} {}",
+        style!(C_CYAN, "\u{2502}"),
+        style!(C_GREEN, "┃ mode: CHAT"),
+        style!(C_CYAN, "│"),
+        style!(C_DIM, "type /mode to switch → CODE"));
     println!();
+}
+
+fn build_project_context(dir: &Path, max_bytes: usize) -> String {
+    let mut out = String::from("Project files:\n");
+    let mut count = 0u32;
+    let max_depth = 4;
+
+    let mut entries: Vec<String> = Vec::new();
+    for entry in WalkDir::new(dir)
+        .max_depth(max_depth as usize)
+        .sort_by_file_name()
+    {
+        let Ok(entry) = entry else { continue };
+        let p = entry.path();
+        let Ok(rel) = p.strip_prefix(dir) else { continue };
+        let rel_str = rel.display().to_string();
+        if rel_str.is_empty() { continue; }
+        if rel_str.starts_with('.') && rel_str != "." { continue; }
+        if rel_str.contains("node_modules") || rel_str.contains("target")
+            || rel_str.contains("__pycache__") || rel_str.contains(".git")
+            || rel_str.contains("venv") || rel_str.contains("dist")
+            || rel_str.contains(".pytest_cache")
+        { continue; }
+
+        if p.is_dir() {
+            if rel.components().count() >= 3 { continue; }
+            entries.push(format!("{}/", rel_str));
+        } else {
+            let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+            entries.push(format!("{}  ({} bytes)", rel_str, size));
+        }
+        count += 1;
+        if out.len() > max_bytes { break; }
+    }
+
+    if count > 0 {
+        out.push_str(&entries.join("\n"));
+        out.push_str("\n\n");
+        out
+    } else {
+        String::new()
+    }
+}
+
+fn detect_project_type(dir: &Path) -> &'static str {
+    if !dir.exists() { return ""; }
+    let entries: Vec<String> = WalkDir::new(dir)
+        .max_depth(1)
+        .into_iter()
+        .filter_map(|e: Result<walkdir::DirEntry, walkdir::Error>| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.file_name().to_string_lossy().to_lowercase())
+        .collect();
+
+    let has_file = |name: &str| entries.iter().any(|f| f == name);
+
+    if has_file("Cargo.toml") { return "rust"; }
+    if has_file("go.mod") { return "go"; }
+    if has_file("pyproject.toml") || has_file("setup.py") || has_file("requirements.txt") { return "python"; }
+    if has_file("package.json") { return "javascript"; }
+    if has_file("index.html") && has_file("style.css") { return "html_css"; }
+    if has_file("dart.yaml") || has_file("pubspec.yaml") { return "dart"; }
+    if has_file("Makefile") { return "cpp"; }
+    ""
+}
+
+fn language_specific_guidance(project_type: &str) -> &'static str {
+    match project_type {
+        "rust" => "\nLanguage context: Rust project. Use cargo build/run. Prefer &str over String where possible. Include Cargo.toml deps.",
+        "go" => "\nLanguage context: Go project. Use go mod tidy. Follow standard library patterns.",
+        "python" => "\nLanguage context: Python project. Use pip install for deps. Follow PEP 8. Use type hints.",
+        "javascript" => "\nLanguage context: JavaScript/Node.js project. Use npm/yarn. Prefer ES modules. Include package.json deps.",
+        "html_css" => "\nLanguage context: HTML/CSS project. Use semantic HTML. Responsive CSS with modern layout (flexbox/grid).",
+        "dart" => "\nLanguage context: Dart/Flutter project. Use pub get for deps. Follow effective Dart guidelines.",
+        "cpp" => "\nLanguage context: C/C++ project. Use make/gcc. Show compilation commands.",
+        _ => "",
+    }
 }
 
 fn build_prompt(session: &ChatSession, client: &OllamaClient) -> String {
     let model_short = client.model.split(':').next().unwrap_or(&client.model);
+    let mode_color = match session.mode {
+        RunMode::Chat => C_GREEN,
+        RunMode::Code => C_MAGENTA,
+    };
     let mut p = String::new();
     p.push_str("\x01");
-    p.push_str(C_GREEN);
+    p.push_str(mode_color);
     p.push_str("\x02");
-    p.push_str(model_short);
+    p.push('[');
+    p.push_str(session.mode.label());
+    p.push(']');
     p.push_str("\x01\x1b[0m\x02");
-    if let Some(ref d) = session.project_dir {
-        p.push(' ');
-        p.push_str("\x01");
-        p.push_str(C_DIM);
-        p.push_str("\x02");
-        p.push_str(&d.display().to_string());
-        p.push_str("\x01\x1b[0m\x02");
-    }
     p.push(' ');
     p.push_str("\x01");
     p.push_str(C_CYAN);
     p.push_str("\x02");
-    p.push('\u{203a}');
+    p.push_str(model_short);
+    p.push('>');
     p.push_str("\x01\x1b[0m\x02");
     p.push(' ');
     p
 }
 
 async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
-    let mut session = ChatSession::new()?;
+    reset_ctrlc_count();
+    let mut session = ChatSession::new(&client.model)?;
     print_welcome(client);
 
     loop {
         let prompt = build_prompt(&session, client);
-        let line = session.readline(&prompt);
-        let line = match line {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  {} input error: {}", style!(C_RED, "err:"), e);
-                if e.kind() == io::ErrorKind::Interrupted
-                    || e.kind() == io::ErrorKind::UnexpectedEof
-                {
-                    break;
+        let mut error_count = 0u8;
+        let line = loop {
+            let line = session.readline(&prompt);
+            match line {
+                Ok(s) => break s,
+                Err(e) => {
+                    eprintln!("  {} input error: {}", style!(C_RED, "err:"), e);
+                    if e.kind() == io::ErrorKind::Interrupted
+                        || e.kind() == io::ErrorKind::UnexpectedEof
+                    {
+                        return Ok(());
+                    }
+                    error_count += 1;
+                    if error_count >= 3 {
+                        eprintln!("  {} too many errors, exiting", style!(C_RED, "err:"));
+                        return Ok(());
+                    }
+                    continue;
                 }
-                continue;
             }
         };
         let trimmed = line.trim();
@@ -943,7 +1217,60 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
             continue;
         }
 
-        let needs_path = has_creation_intent(trimmed) && !has_file_path(trimmed);
+        if trimmed.eq_ignore_ascii_case("/mode") {
+            session.mode = session.mode.toggle();
+            let mode_label = session.mode.label();
+            let mode_color = match session.mode {
+                RunMode::Chat => C_GREEN,
+                RunMode::Code => C_MAGENTA,
+            };
+            let hint = match session.mode {
+                RunMode::Chat => "reply in plain text — ask questions, chat",
+                RunMode::Code => "generate code/files — create, fix, build",
+            };
+            println!("{}", style!(C_DIM, "│"));
+            println!("{} {} {}",
+                style!(C_CYAN, "│"),
+                style!(mode_color, "switched to {} mode", mode_label),
+                style!(C_DIM, ""));
+            println!("{} {} {}", style!(C_CYAN, "│"), style!(C_DIM, "\u{2502}"), style!(C_DIM, "{}", hint));
+            println!("{}", style!(C_DIM, "│"));
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("/why") {
+            let intent_name = match session.last_intent {
+                TaskIntent::FastAnswer => "chat/question",
+                TaskIntent::Planning => "planning",
+                TaskIntent::WebNeeded => "web search needed",
+                TaskIntent::CodeAction => "code/file action",
+            };
+            println!("{}", style!(C_DIM, "│"));
+            println!("{} {} {} {}",
+                style!(C_CYAN, "│"),
+                style!(C_WHITE_B, "last intent:"),
+                style!(C_GREEN, "{}", intent_name),
+                style!(C_DIM, ""));
+            println!("{} {} {} {}",
+                style!(C_CYAN, "│"),
+                style!(C_WHITE_B, "last input:"),
+                style!(C_DIM, "\"{}\"", session.last_user_input),
+                style!(C_DIM, ""));
+            let create_hit = has_creation_intent(&session.last_user_input);
+            let lower_db = session.last_user_input.to_lowercase();
+            let fix_hit = lower_db.starts_with("fix ") || lower_db.starts_with("refactor ")
+                || lower_db.starts_with("rename ") || lower_db.starts_with("delete ")
+                || lower_db.starts_with("remove ") || lower_db.starts_with("optimize ")
+                || lower_db.starts_with("update ");
+            let is_q = lower_db.starts_with("what ") || lower_db.starts_with("how ")
+                || lower_db.starts_with("why ") || lower_db.starts_with("explain ");
+            println!("{} {}", style!(C_CYAN, "│"), style!(C_DIM, "  has_creation_intent={}", create_hit));
+            println!("{} {}", style!(C_CYAN, "│"), style!(C_DIM, "  fix_window={}  is_question={}", fix_hit, is_q));
+            println!("{}", style!(C_DIM, "│"));
+            continue;
+        }
+
+        let needs_path = (session.mode == RunMode::Code || has_creation_intent(trimmed)) && !has_file_path(trimmed);
         let final_prompt = if needs_path {
             session.add_history(trimmed);
             let path = prompt_for_path(&mut session)?;
@@ -958,13 +1285,27 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
         };
 
         let intent = classify_intent(trimmed);
+        session.last_intent = intent.clone();
+        session.last_user_input = trimmed.to_string();
         let instruction = intent_instruction(&intent);
 
+        if session.mode == RunMode::Code {
+            print!("{} ", style!(C_CYAN, "\u{2502}"));
+            println!("{}", style!(C_MAGENTA, "generating code..."));
+        } else if intent == TaskIntent::CodeAction {
+            print!("{} ", style!(C_CYAN, "\u{2502}"));
+            println!("{}", style!(C_CYAN, "Analyzing..."));
+        }
+
         let search_ctx = session.build_search_context();
+        let project_ctx = session.build_project_context();
         let history_ctx = session.build_chat_history();
         let full_prompt = {
             let mut p = instruction.to_string();
             p.push('\n');
+            if !project_ctx.is_empty() {
+                p.push_str(&project_ctx);
+            }
             p.push_str(&final_prompt);
             if !search_ctx.is_empty() {
                 p.push_str(&search_ctx);
@@ -976,13 +1317,33 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
         println!("{}", style!(C_DIM, "\u{2500}\u{2500} rem \u{2500}\u{2500}"));
 
         let start = std::time::Instant::now();
-        let (spin_flag, spin_handle) = spawn_spinner("REM is writing...");
-        let system_prompt = match intent {
-            TaskIntent::CodeAction => CHAT_SYSTEM_PROMPT_CODE,
-            _ => CHAT_SYSTEM_PROMPT_CONVERSATIONAL,
+        let _chat_spinner = SpinnerGuard::new("REM is writing...");
+        let system_prompt = match session.mode {
+            RunMode::Chat => CHAT_SYSTEM_PROMPT_CONVERSATIONAL,
+            RunMode::Code => CHAT_SYSTEM_PROMPT_CODE,
         };
-        let result = client.complete_chat_stream(&full_prompt, system_prompt, &history_ctx).await;
-        clear_spinner(spin_flag, spin_handle).await;
+
+        let lang_guidance = if let Some(ref dir) = session.project_dir {
+            let ptype = detect_project_type(dir);
+            if !ptype.is_empty() {
+                language_specific_guidance(ptype)
+            } else { "" }
+        } else { "" };
+
+        let system_prompt = if !lang_guidance.is_empty() {
+            format!("{}{}", system_prompt, lang_guidance)
+        } else {
+            system_prompt.to_string()
+        };
+
+        if session.mode == RunMode::Chat && intent == TaskIntent::CodeAction {
+            println!("{}", style!(C_DIM, "\u{2502}"));
+            println!("{} {}",
+                style!(C_YELLOW, "\u{2502}  hint:"),
+                style!(C_CYAN, "this looks like a code request — type /mode to switch to CODE"));
+            println!("{}", style!(C_DIM, "\u{2502}"));
+        }
+        let result = client.complete_chat_stream(&full_prompt, &system_prompt, &history_ctx).await;
         let elapsed = start.elapsed();
 
         match result {
@@ -991,17 +1352,24 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
                     eprintln!("\n  {} raw response:\n{}\n", style!(C_DIM, "verbose:"), text);
                 }
 
-                let cleaned = text.trim().to_string();
+                let (was_validated, validated_text) = validate_chat_response(&text, &intent);
+                let cleaned = if was_validated && session.mode != RunMode::Code {
+                    println!("{} {}", style!(C_YELLOW, "│"), style!(C_DIM, "(response contained unexpected code — showing text only)"));
+                    println!("{}", style!(C_CYAN, "│"));
+                    validated_text
+                } else {
+                    text.trim().to_string()
+                };
 
-                if intent == TaskIntent::CodeAction {
+                let treat_as_code = intent == TaskIntent::CodeAction || session.mode == RunMode::Code;
+
+                if treat_as_code {
                     let code = extract_code_block(&cleaned);
                     let files = extract_code_blocks_with_names(&cleaned);
 
                     if !files.is_empty() {
                         session.last_files = files.clone();
-                        if !code.is_empty() {
-                            session.last_code = code;
-                        }
+                        session.last_code = if code.is_empty() { String::new() } else { code };
                         println!("{}", style!(C_CYAN, "│"));
                         println!("{} {} {}",
                             style!(C_CYAN, "│"),
@@ -1029,23 +1397,27 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
                             style!(C_GREEN, "detected code block — use /write <path> to save"));
                         println!("{}", style!(C_CYAN, "│"));
                     } else {
+                        for line in cleaned.lines() {
+                            println!("{} {}", style!(C_CYAN, "│"), line);
+                        }
+                        println!("{}", style!(C_CYAN, "│"));
                         println!("{} {}",
                             style!(C_CYAN, "│"),
                             style!(C_DIM, "\u{23f1} {:.1}s", elapsed.as_secs_f64()));
                     }
                 } else {
-                    // FastAnswer, Planning, WebNeeded — print CLEAN response
                     if cleaned.is_empty() {
                         println!("{} {}",
                             style!(C_YELLOW, "│"),
                             style!(C_DIM, "(empty response)"));
                     } else {
-                        println!("{} {}",
-                            style!(C_CYAN, "│"),
-                            style!(C_DIM, "\u{23f1} {:.1}s", elapsed.as_secs_f64()));
                         for line in cleaned.lines() {
                             println!("{} {}", style!(C_CYAN, "│"), line);
                         }
+                        println!("{}", style!(C_CYAN, "│"));
+                        println!("{} {}",
+                            style!(C_CYAN, "│"),
+                            style!(C_DIM, "\u{23f1} {:.1}s", elapsed.as_secs_f64()));
                     }
                 }
 
@@ -1065,39 +1437,133 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
             }
         }
     }
+    session.feedback.flush();
     Ok(())
 }
 
 fn has_creation_intent(input: &str) -> bool {
     let lower = input.to_lowercase();
-    let creation_words = [
-        "create a", "create me a", "create an",
-        "build a", "build me a", "build an",
-        "generate a", "generate me a",
-        "scaffold a", "spin up a",
-        "write a", "write me a", "code a",
-        "make a file", "make a component", "make a project",
-        "make a website", "make a script", "make an app", "make a page",
-        "make me a file", "make me a component", "make me a website",
-        "make me a script", "make me an app",
+
+    let verb_phrases = [
+        "create a ", "create an ", "create the ", "create me a ", "create my ",
+        "build a ", "build an ", "build the ", "build me a ", "build my ",
+        "make a ", "make an ", "make the ", "make me a ", "make my ",
+        "generate a ", "generate an ", "generate the ", "generate me a ",
+        "scaffold a ", "scaffold an ", "scaffold the ",
+        "code a ", "code an ", "code the ", "code me a ",
+        "spin up a ", "spin up an ", "spin up the ",
     ];
-    creation_words.iter().any(|w| lower.contains(w))
+
+    let write_objects = [
+        "write a file", "write a component", "write a function", "write a class",
+        "write a module", "write a script", "write a test", "write a handler",
+        "write a service", "write a hook", "write a config", "write a schema",
+        "write a migration", "write a seed", "write a cli", "write a tool",
+        "write an app", "write an api", "write an endpoint",
+    ];
+
+    let is_question_input = has_question_prefix(lower.as_str());
+
+    if verb_phrases.iter().any(|v| lower.starts_with(v) || lower.contains(&format!(" {}", v))) {
+        if !is_question_input {
+            return true;
+        }
+    }
+
+    if write_objects.iter().any(|w| lower.contains(w)) {
+        if !is_question_input {
+            return true;
+        }
+    }
+
+    let suffix_phrases = [
+        "a file", "an app", "a component", "a project", "a website",
+        "a script", "a page", "a module", "a class", "a function",
+        "a service", "a handler", "a hook", "a config", "a schema",
+        "a migration", "a seed", "a test", "a cli", "a tool",
+        "a layout", "a route", "an endpoint", "an api",
+    ];
+
+    for verb in [
+        "create", "build", "generate", "scaffold", "write", "code",
+        "make", "spin up",
+    ] {
+        for suffix in &suffix_phrases {
+            let combined = format!("{} {}", verb, suffix);
+            if lower.starts_with(&combined) || lower.contains(&format!(" {}", combined)) {
+                if !is_question_about(lower.as_str(), &combined) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn has_question_prefix(input: &str) -> bool {
+    let question_prefixes = [
+        "how to", "how do i", "how do you", "how can i", "how would you",
+        "how should i", "what is the best way to", "what's the best way to",
+        "explain how to", "tell me how to", "describe how to",
+        "show me how to", "can you explain how to", "can you show me how to",
+        "why should i", "when should i", "where should i",
+        "what is", "what are", "what does", "how does",
+        "why is", "why are", "why does",
+        "tell me about", "describe", "define",
+    ];
+    let lowered = input.to_lowercase();
+    question_prefixes.iter().any(|p| lowered.starts_with(p))
+}
+
+fn is_question_about(input: &str, action_phrase: &str) -> bool {
+    let lowered = input.to_lowercase();
+    if !lowered.contains(action_phrase) {
+        return false;
+    }
+    has_question_prefix(lowered.as_str())
 }
 
 fn has_file_path(input: &str) -> bool {
     let lower = input.to_lowercase();
     lower.contains(".html") || lower.contains(".css") || lower.contains(".js")
-        || lower.contains('/') || lower.contains(".ts") || lower.contains("file")
-        || lower.contains("path") || lower.contains("directory") || lower.contains("folder")
-        || lower.contains("into ") || lower.contains("in ")
+        || lower.contains(".ts") || lower.contains(".py") || lower.contains(".rs")
+        || lower.contains(".json") || lower.contains(".toml") || lower.contains(".yaml")
+        || lower.contains(".yml") || lower.contains(".md") || lower.contains(".txt")
+        || lower.contains(".go") || lower.contains(".dart") || lower.contains(".sh")
+        || (lower.contains("/") && !lower.starts_with("http"))
+        || lower.contains("into ./") || lower.contains("into /")
+        || lower.contains("save to ") || lower.contains("save at ")
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum TaskIntent {
     FastAnswer,
     Planning,
     WebNeeded,
     CodeAction,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum RunMode {
+    Chat,
+    Code,
+}
+
+impl RunMode {
+    fn toggle(&self) -> RunMode {
+        match self {
+            RunMode::Chat => RunMode::Code,
+            RunMode::Code => RunMode::Chat,
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            RunMode::Chat => "CHAT",
+            RunMode::Code => "CODE",
+        }
+    }
 }
 
 fn classify_intent(input: &str) -> TaskIntent {
@@ -1122,6 +1588,18 @@ fn classify_intent(input: &str) -> TaskIntent {
         return TaskIntent::WebNeeded;
     }
 
+    let is_question = lower.starts_with("what ")
+        || lower.starts_with("how ")
+        || lower.starts_with("why ")
+        || lower.starts_with("when ")
+        || lower.starts_with("where ")
+        || lower.starts_with("who ")
+        || lower.starts_with("can you explain")
+        || lower.starts_with("explain ")
+        || lower.starts_with("describe ")
+        || lower.starts_with("tell me ")
+        || lower.starts_with("show me ");
+
     let plan_indicators = lower.contains("how would you")
         || lower.contains("how should i")
         || lower.contains("what's the best way")
@@ -1142,17 +1620,29 @@ fn classify_intent(input: &str) -> TaskIntent {
         return TaskIntent::Planning;
     }
 
-    if has_creation_intent(input) {
+    let has_create = has_creation_intent(input);
+
+    if is_question && has_create {
+        return TaskIntent::FastAnswer;
+    }
+
+    if has_create {
         return TaskIntent::CodeAction;
     }
 
-    let fix_indicators = lower.starts_with("fix ")
-        || lower.starts_with("refactor ")
-        || lower.starts_with("rename ")
-        || lower.starts_with("delete ")
-        || lower.starts_with("optimize ")
-        || lower.starts_with("update ");
-    if fix_indicators {
+    let fix_indicators = lower.starts_with("fix the ")
+        || lower.starts_with("fix my ")
+        || lower.starts_with("fix this ")
+        || lower.starts_with("refactor the ")
+        || lower.starts_with("refactor my ")
+        || lower.starts_with("rename the ")
+        || lower.starts_with("delete the ")
+        || lower.starts_with("remove the ")
+        || lower.starts_with("optimize the ")
+        || lower.starts_with("update the ")
+        || lower.starts_with("update my ");
+
+    if fix_indicators && !is_question {
         return TaskIntent::CodeAction;
     }
 
@@ -1161,11 +1651,56 @@ fn classify_intent(input: &str) -> TaskIntent {
 
 fn intent_instruction(intent: &TaskIntent) -> &'static str {
     match intent {
-        TaskIntent::FastAnswer => "\n\n[ANSWER CONCISELY — no code generation, no file format. Just a clear text response.]",
+        TaskIntent::FastAnswer => "\n\n[ANSWER CONCISELY — no code generation, no file format. Just a clear text response. If uncertain whether user wants code, ask first.]",
         TaskIntent::Planning => "\n\n[PLAN FIRST — do NOT generate code. Give alternatives, trade-offs, and a recommendation. The user will tell you when to start coding.]",
         TaskIntent::WebNeeded => "\n\n[WEB SEARCH NEEDED — tell the user to run /search <query> to get current info before you can answer accurately.]",
-        TaskIntent::CodeAction => "\n\n[USER WANTS CODE — follow the multi-file format rules to generate complete, runnable files.]",
+        TaskIntent::CodeAction => "\n\n[USER WANTS CODE — first summarize what you'll create, then output files using the multi-file format.]",
     }
+}
+
+fn validate_chat_response(response: &str, intent: &TaskIntent) -> (bool, String) {
+    if *intent != TaskIntent::CodeAction {
+        let has_code_fences = response.contains("```");
+        let has_multi_file = response.contains("### ") && has_code_fences;
+        let has_json = response.trim().starts_with('{') && (response.contains("\"code\"") || response.contains("\"files\""));
+
+        if has_multi_file || has_json {
+            let code_stripped = strip_code_blocks(response);
+            if !code_stripped.trim().is_empty() {
+                return (true, code_stripped);
+            }
+            return (true, "I understood your question. Let me answer directly: ".to_string());
+        }
+    }
+
+    if response.trim().is_empty() {
+        return (true, "(No response generated — please try again or rephrase)".to_string());
+    }
+
+    (false, String::new())
+}
+
+fn strip_code_blocks(text: &str) -> String {
+    let mut result = String::new();
+    let mut in_fence = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if line.starts_with("### ") || line.starts_with("## ") {
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    result.trim().to_string()
 }
 
 fn prompt_for_path(session: &mut ChatSession) -> io::Result<String> {
@@ -1214,7 +1749,10 @@ fn handle_write(session: &ChatSession, path: &str) {
     }
     if let Some(parent) = abs_path.parent() {
         if !parent.as_os_str().is_empty() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("  {} cannot create directory {}: {}", style!(C_RED, "✗"), parent.display(), e);
+                return;
+            }
         }
     }
     match fs::write(&abs_path, &session.last_code) {
@@ -1230,15 +1768,38 @@ fn auto_write_files(session: &mut ChatSession, files: &[FileEntry]) {
         return;
     }
 
+    println!("{}", style!(C_CYAN, "│"));
+    println!("{} {} {}",
+        style!(C_CYAN, "│"),
+        style!(C_WHITE_B, "Plan: creating {} file(s)", files.len()),
+        style!(C_DIM, ""));
+    for f in files {
+        let icon = file_icon(&f.path);
+        if f.path.is_empty() {
+            println!("{}   {} {} ({})", style!(C_CYAN, "│"), icon,
+                style!(C_WHITE_B, "unnamed"), style!(C_DIM, "{} bytes", f.content.len()));
+        } else {
+            let lines = f.content.lines().count();
+            println!("{}   {} {} ({}, {} lines)",
+                style!(C_CYAN, "│"), icon,
+                style!(C_WHITE_B, "{}", f.path),
+                style!(C_DIM, "{} bytes", f.content.len()),
+                style!(C_DIM, "{}", lines));
+        }
+    }
+    println!("{}", style!(C_CYAN, "│"));
     println!("{} {} {}",
         style!(C_MAGENTA, "│  ?"),
         style!(C_WHITE_B, "Write all {} files? [Y/n]", files.len()),
         style!(C_DIM, "(press Enter to confirm)"));
+    println!("{} {}", style!(C_MAGENTA, "│"), style!(C_DIM, "  Type /code to preview, 'n' to cancel"));
+    println!("{}", style!(C_CYAN, "│"));
 
     let input = session.readline("rem> ").unwrap_or_else(|_| String::from("y"));
     let input = input.trim();
     if !input.is_empty() && !input.eq_ignore_ascii_case("y") && !input.eq_ignore_ascii_case("yes") {
         println!("{} {}", style!(C_YELLOW, "│  !"), "skipped. Use /write <path> to save individually.");
+        println!("{}", style!(C_CYAN, "│"));
         return;
     }
 
@@ -1257,7 +1818,11 @@ fn auto_write_files(session: &mut ChatSession, files: &[FileEntry]) {
 
         if let Some(parent) = abs_path.parent() {
             if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!("{}   {} cannot create dir {}: {}",
+                        style!(C_RED, "│ ✗"), style!(C_WHITE_B, "{}", f.path), parent.display(), e);
+                    continue;
+                }
             }
         }
 
@@ -1314,6 +1879,11 @@ fn handle_undo(session: &mut ChatSession) {
         }
     }
     if removed > 0 {
+        let input = session.last_user_input.clone();
+        let intent = session.last_intent.clone();
+        if intent == TaskIntent::CodeAction {
+            session.feedback.record_correction(&input, &intent, &TaskIntent::FastAnswer);
+        }
         println!("  {} {} {} file(s) removed.", style!(C_GREEN, "│ ✓"), removed, style!(C_DIM, ""));
     }
 }
@@ -1386,9 +1956,9 @@ fn highlight_code(content: &str, lang_hint: &str) -> String {
 }
 
 fn highlight_html(code: &str) -> String {
-    let tag_re = Regex::new(r"(</?\w+[^>]*>)").unwrap();
-    let attr_re = Regex::new(r#"("[^"]*")"#).unwrap();
-    let comment_re = Regex::new(r"(<!--.*?-->)").unwrap();
+    let tag_re = Regex::new(r"(</?\w+[^>]*>)").expect("invalid regex literal");
+    let attr_re = Regex::new(r#"("[^"]*")"#).expect("invalid regex literal");
+    let comment_re = Regex::new(r"(<!--.*?-->)").expect("invalid regex literal");
     let mut out = code.to_string();
     out = comment_re.replace_all(&out, |caps: &regex::Captures| {
         style!(C_DIM, "{}", &caps[1])
@@ -1404,9 +1974,9 @@ fn highlight_html(code: &str) -> String {
 }
 
 fn highlight_css(code: &str) -> String {
-    let prop_re = Regex::new(r"(?m)^(\s*)([a-zA-Z-]+)(\s*:)").unwrap();
-    let val_re = Regex::new(r"(:\s*)([^;}{]+)").unwrap();
-    let comment_re = Regex::new(r"(/\*.*?\*/)").unwrap();
+    let prop_re = Regex::new(r"(?m)^(\s*)([a-zA-Z-]+)(\s*:)").expect("invalid regex literal");
+    let val_re = Regex::new(r"(:\s*)([^;}{]+)").expect("invalid regex literal");
+    let comment_re = Regex::new(r"(/\*.*?\*/)").expect("invalid regex literal");
     let mut out = code.to_string();
     out = comment_re.replace_all(&out, |caps: &regex::Captures| {
         style!(C_DIM, "{}", &caps[1])
@@ -1429,9 +1999,9 @@ fn highlight_css(code: &str) -> String {
 }
 
 fn highlight_js(code: &str) -> String {
-    let kw_re = Regex::new(r"\b(const|let|var|function|return|if|else|for|while|class|import|export|from|async|await|try|catch|new|this|document|console|window)\b").unwrap();
-    let str_re = Regex::new(r#"('[^']*'|"[^"]*"|`[^`]*`)"#).unwrap();
-    let comment_re = Regex::new(r"(//.*)").unwrap();
+    let kw_re = Regex::new(r"\b(const|let|var|function|return|if|else|for|while|class|import|export|from|async|await|try|catch|new|this|document|console|window)\b").expect("invalid regex literal");
+    let str_re = Regex::new(r#"('[^']*'|"[^"]*"|`[^`]*`)"#).expect("invalid regex literal");
+    let comment_re = Regex::new(r"(//.*)").expect("invalid regex literal");
     let mut out = code.to_string();
     out = comment_re.replace_all(&out, |caps: &regex::Captures| {
         style!(C_DIM, "{}", &caps[1])
@@ -1530,6 +2100,7 @@ fn print_chat_help() {
     println!("{}", style!(d, "\u{2502}"));
     println!("{}  {}{}", style!(v, "\u{2502}"), style!(h, "\u{2500}\u{2500} COMMANDS \u{2500}\u{2500}"), style!(d, ""));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/help"),          style!(d, "show this help"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/mode"),          style!(d, "toggle CHAT ↔ CODE mode"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/write <path>"),  style!(d, "save last code to file"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/save <path>"),   style!(d, "same as /write"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/dir <path>"),    style!(d, "set project root"));
@@ -1537,10 +2108,12 @@ fn print_chat_help() {
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/code"),          style!(d, "show last generated code"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/files"),         style!(d, "list project files tree"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/undo"),          style!(d, "delete last written files"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/why"),           style!(d, "show why last intent was chosen"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "exit / quit"),    style!(d, "exit REM"));
     println!("{}", style!(v, "\u{2502}"));
     println!("{}  {}", style!(v, "\u{2502}"), style!(h, "\u{2500}\u{2500} TIPS \u{2500}\u{2500}"));
-    println!("{}   {} describe what you want \u{2014} REM detects", style!(v, "\u{2502}"), style!(d, "\u{2022}"));
+    println!("{}   {} use {} to toggle between chat and code modes", style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "/mode"));
+    println!("{}   {} describe what you want \u{2014} REM detects intent", style!(v, "\u{2502}"), style!(d, "\u{2022}"));
     println!("{}   {} multi-file intent and auto-writes after confirmation", style!(v, "\u{2502}"), style!(d, "\u{2022}"));
     println!("{}   {} run {} to scaffold a new project instantly", style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "rem new <name>"));
     println!("{}", style!(v, "\u{2502}"));
@@ -1671,9 +2244,11 @@ fn build_context(target: &Path, max_bytes: usize) -> Result<String> {
 }
 
 fn truncate_bytes(s: &str, max: usize) -> String {
+    if max == 0 || s.is_empty() { return "[truncated]".to_string(); }
     if s.len() <= max { return s.to_string(); }
     let mut end = max;
     while !s.is_char_boundary(end) { end -= 1; }
+    if end == 0 { return "[truncated]".to_string(); }
     format!("{}\n...[truncated]", &s[..end])
 }
 
@@ -2935,5 +3510,86 @@ h1 { color: red; }
         assert_eq!(human_size(500), "500");
         assert!(human_size(2048).contains("2"));
         assert!(human_size(2048).contains("K"));
+    }
+
+    #[test]
+    fn greeting_is_fast_answer() {
+        assert_eq!(classify_intent("hii"), TaskIntent::FastAnswer);
+        assert_eq!(classify_intent("hello"), TaskIntent::FastAnswer);
+        assert_eq!(classify_intent("heyy there"), TaskIntent::FastAnswer);
+        assert_eq!(classify_intent("thanks!"), TaskIntent::FastAnswer);
+    }
+
+    #[test]
+    fn question_about_creation_is_fast_answer() {
+        assert_eq!(classify_intent("explain how to make a file"), TaskIntent::FastAnswer);
+        assert_eq!(classify_intent("how to create a React component properly"), TaskIntent::FastAnswer);
+        assert_eq!(classify_intent("what is the best way to scaffold a project"), TaskIntent::Planning);
+        assert_eq!(classify_intent("how do I build a website from scratch"), TaskIntent::FastAnswer);
+    }
+
+    #[test]
+    fn clear_creation_still_code_action() {
+        assert_eq!(classify_intent("create a React component called Button"), TaskIntent::CodeAction);
+        assert_eq!(classify_intent("make a navbar component"), TaskIntent::CodeAction);
+        assert_eq!(classify_intent("write a function to sort arrays"), TaskIntent::CodeAction);
+    }
+
+    #[test]
+    fn fix_is_still_code_action() {
+        assert_eq!(classify_intent("fix the bug in auth middleware"), TaskIntent::CodeAction);
+        assert_eq!(classify_intent("refactor the user service"), TaskIntent::CodeAction);
+    }
+
+    #[test]
+    fn has_creation_intent_regression() {
+        assert!(has_creation_intent("create a file called index.html"));
+        assert!(has_creation_intent("build me a website"));
+        assert!(has_creation_intent("make a component"));
+        assert!(!has_creation_intent("explain how to create a file"));
+        assert!(!has_creation_intent("how do i make a test"));
+        assert!(!has_creation_intent("hii"));
+        assert!(!has_creation_intent("what is the best way to build a project"));
+    }
+
+    #[test]
+    fn is_question_about_works() {
+        assert!(is_question_about("how to create a file", "create a file"));
+        assert!(is_question_about("explain how to make a component", "make a component"));
+        assert!(!is_question_about("create a file now", "create a file"));
+        assert!(!is_question_about("how should i", "create a file"));
+    }
+
+    #[test]
+    fn strip_code_blocks_works() {
+        let text = "Here is some text.\n```html\n<div>code</div>\n```\nMore text.";
+        let result = strip_code_blocks(text);
+        assert!(result.contains("Here is some text"));
+        assert!(result.contains("More text"));
+        assert!(!result.contains("<div>code</div>"));
+        assert!(!result.contains("```"));
+    }
+
+    #[test]
+    fn validate_chat_response_strips_code() {
+        let response = "Here is your site:\n\n### index.html\n```html\n<div>hi</div>\n```";
+        let (was_validated, text) = validate_chat_response(response, &TaskIntent::FastAnswer);
+        assert!(was_validated);
+        assert!(text.contains("Here is your site"));
+        assert!(!text.contains("<div>hi</div>"));
+    }
+
+    #[test]
+    fn validate_chat_response_passes_valid() {
+        let response = "Hi there! How can I help you today?";
+        let (was_validated, _) = validate_chat_response(response, &TaskIntent::FastAnswer);
+        assert!(!was_validated);
+    }
+
+    #[test]
+    fn validate_chat_allows_code_action() {
+        let response = "### app.js\n```js\nconst x = 1;\n```";
+        let (was_validated, _) = validate_chat_response(response, &TaskIntent::CodeAction);
+        assert!(!was_validated);
     }
 }

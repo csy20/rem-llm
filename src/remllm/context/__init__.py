@@ -5,6 +5,12 @@ from remllm.context.adaptive import (
     build_adaptive_prompt,
     classify_task,
 )
+from remllm.context.classifier import (
+    IntentLabel,
+    IntentClassification,
+    classify_intent_sync,
+    classify_with_llm,
+)
 from remllm.context.indexer import CodebaseIndexer, CodeChunk, index_codebase
 from remllm.context.structured import (
     FileOperation,
@@ -20,9 +26,13 @@ __all__ = [
     "build_adaptive_prompt",
     "build_structured_prompt",
     "classify_task",
+    "classify_intent_sync",
+    "classify_with_llm",
     "CodebaseIndexer",
     "CodeChunk",
     "FileOperation",
+    "IntentLabel",
+    "IntentClassification",
     "StructuredOutput",
     "ToolCall",
     "index_codebase",

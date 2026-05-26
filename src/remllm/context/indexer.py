@@ -1,17 +1,88 @@
 """Lightweight codebase indexer — chunks by function/class/component, embeds, and retrieves.
 
-No GPU required — uses CPU-friendly sentence-transformers or Ollama embeddings.
+Embedding backends (auto-selected in order of preference):
+  1. sentence-transformers (CPU-friendly, all-MiniLM-L6-v2, 384-dim)
+  2. Ollama embeddings API (via /api/embed endpoint)
+  3. SHA-256 pseudo-embeddings (deterministic fallback, no install needed)
 """
 
 import hashlib
 import json
 import logging
+import os
 import re
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 _logger = logging.getLogger(__name__)
+
+_EMBED_DIM = 384
+_sentence_model = None
+
+
+def _get_sentence_model():
+    global _sentence_model
+    if _sentence_model is not None:
+        return _sentence_model
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        _sentence_model = SentenceTransformer("all-MiniLM-L6-v2")
+        _logger.info("Using sentence-transformers backend (all-MiniLM-L6-v2)")
+    except ImportError:
+        _sentence_model = False
+    except Exception as exc:
+        _logger.warning("Failed to load sentence-transformers: %s", exc)
+        _sentence_model = False
+    return _sentence_model
+
+
+def _embed_text_backend(text: str) -> list[float]:
+    model = _get_sentence_model()
+    if model and model is not False:
+        try:
+            import numpy as np
+
+            emb = model.encode(text, convert_to_numpy=True)
+            if isinstance(emb, np.ndarray):
+                return emb.astype(float).tolist()
+        except Exception:
+            pass
+
+    ollama_url = os.environ.get("OLLAMA_API_URL", "http://localhost:11434")
+    try:
+        import urllib.request
+
+        import json as _json
+
+        req = urllib.request.Request(
+            f"{ollama_url}/api/embed",
+            data=_json.dumps({"model": "nomic-embed-text", "input": text}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read())
+            emb = data.get("embeddings", [[]])[0]
+            if emb:
+                return emb
+    except Exception:
+        pass
+
+    return _sha256_embed(text)
+
+
+def _sha256_embed(text: str) -> list[float]:
+    hash_bytes = hashlib.sha256(text.encode("utf-8")).digest()
+    embedding = []
+    for i in range(0, min(len(hash_bytes) - 3, _EMBED_DIM * 4), 4):
+        val = struct.unpack(">f", hash_bytes[i : i + 4])[0]
+        embedding.append(val)
+    while len(embedding) < _EMBED_DIM:
+        embedding.append(0.0)
+    return embedding[:_EMBED_DIM]
 
 
 @dataclass
@@ -269,17 +340,7 @@ class CodebaseIndexer:
         return "\n".join(block_lines)
 
     def _embed_text(self, text: str) -> list[float]:
-        import struct
-
-        hash_bytes = hashlib.sha256(text.encode("utf-8")).digest()
-        dim = 384
-        embedding = []
-        for i in range(0, min(len(hash_bytes) - 3, dim * 4), 4):
-            val = struct.unpack(">f", hash_bytes[i : i + 4])[0]
-            embedding.append(val)
-        while len(embedding) < dim:
-            embedding.append(0.0)
-        return embedding[:dim]
+        return _embed_text_backend(text)
 
     def _cosine_sim(self, a: list[float], b: list[float]) -> float:
         dot = sum(x * y for x, y in zip(a, b))

@@ -16,6 +16,9 @@ from remllm.eval.beginner_eval import BeginnerEvaluator
 from remllm.eval.comparator import compare_reports
 from remllm.eval.executable import ExecutableEvaluator
 from remllm.eval.quality import QualityEvaluator
+from remllm.eval.security_eval import SecurityEvaluator
+from remllm.eval.suite import run_full_evaluation
+from remllm.eval.typescript_eval import TypeScriptEvaluator
 
 
 def _load_eval_rows(config_path: str, data_key: str = "eval_file"):
@@ -96,6 +99,39 @@ def cmd_eval_beginner(args: argparse.Namespace) -> None:
     report = evaluator.evaluate(args.model, rows, timeout_s=args.timeout_s)
     report.write(Path(args.report))
     print(json.dumps(report.rates, indent=2))
+
+
+def cmd_eval_security(args: argparse.Namespace) -> None:
+    rows, _, _ = _load_eval_rows(args.config)
+    if not rows:
+        return
+    evaluator = SecurityEvaluator()
+    report = evaluator.evaluate(args.model, rows, timeout_s=args.timeout_s)
+    report.write(Path(args.report))
+    print(json.dumps(report.rates, indent=2))
+
+
+def cmd_eval_typescript(args: argparse.Namespace) -> None:
+    rows, _, _ = _load_eval_rows(args.config)
+    if not rows:
+        return
+    evaluator = TypeScriptEvaluator()
+    report = evaluator.evaluate(args.model, rows, timeout_s=args.timeout_s)
+    report.write(Path(args.report))
+    print(json.dumps(report.rates, indent=2))
+
+
+def cmd_eval_all(args: argparse.Namespace) -> None:
+    rows, _, _ = _load_eval_rows(args.config)
+    if not rows:
+        return
+    run_full_evaluation(
+        args.model,
+        rows,
+        Path(args.output_dir),
+        prefix=args.prefix,
+        timeout_s=args.timeout_s,
+    )
 
 
 def cmd_eval_benchmark(args: argparse.Namespace) -> None:
@@ -292,6 +328,31 @@ def main():
     eq_bench.add_argument("--timeout-s", type=int, default=180)
     eq_bench.add_argument("--report", default="models/evals/benchmark.json")
 
+    eq_sec = eq_sub.add_parser(
+        "security", help="Run security vulnerability scan on model output"
+    )
+    eq_sec.add_argument("--config", default="config/config.yaml")
+    eq_sec.add_argument("--model", required=True)
+    eq_sec.add_argument("--report", required=True)
+    eq_sec.add_argument("--timeout-s", type=int, default=30)
+
+    eq_ts = eq_sub.add_parser(
+        "typescript", help="Run TypeScript type-checking evaluation"
+    )
+    eq_ts.add_argument("--config", default="config/config.yaml")
+    eq_ts.add_argument("--model", required=True)
+    eq_ts.add_argument("--report", required=True)
+    eq_ts.add_argument("--timeout-s", type=int, default=30)
+
+    eq_all = eq_sub.add_parser(
+        "all", help="Run full evaluation suite (quality + exec + security + beginner)"
+    )
+    eq_all.add_argument("--config", default="config/config.yaml")
+    eq_all.add_argument("--model", required=True)
+    eq_all.add_argument("--output-dir", default="models/evals")
+    eq_all.add_argument("--prefix", default="eval")
+    eq_all.add_argument("--timeout-s", type=int, default=30)
+
     # compare
     cmp = sub.add_parser("compare", help="Compare baseline and post-train reports")
     cmp.add_argument("--baseline", required=True)
@@ -346,6 +407,9 @@ def main():
             "quality": cmd_eval_quality,
             "exec": cmd_eval_exec,
             "beginner": cmd_eval_beginner,
+            "security": cmd_eval_security,
+            "typescript": cmd_eval_typescript,
+            "all": cmd_eval_all,
             "benchmark": cmd_eval_benchmark,
         }.get(str(getattr(a, "eval_command", "") or ""), lambda _: eq.print_help())(a),
         "compare": cmd_compare,

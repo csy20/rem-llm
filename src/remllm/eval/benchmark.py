@@ -5,6 +5,7 @@ import json
 import statistics
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -67,6 +68,26 @@ def summarize(times: list[float], output_lengths: list[int]) -> dict:
     }
 
 
+def _benchmark_single_model(
+    model_name: str, sample_rows: list[dict], timeout_s: int
+) -> dict:
+    latencies = []
+    output_lengths = []
+    failures = []
+    for index, row in enumerate(sample_rows, start=1):
+        prompt = build_prompt(row)
+        try:
+            output, elapsed = run_prompt(model_name, prompt, timeout_s)
+            latencies.append(elapsed)
+            output_lengths.append(len(output))
+        except Exception as exc:
+            failures.append({"sample_index": index, "error": str(exc)})
+    return {
+        "summary": summarize(latencies, output_lengths),
+        "failures": failures,
+    }
+
+
 def benchmark_models(
     model_names: list[str],
     eval_file: Path,
@@ -85,22 +106,20 @@ def benchmark_models(
         "models": {},
     }
 
-    for model_name in model_names:
-        latencies = []
-        output_lengths = []
-        failures = []
-        for index, row in enumerate(sample_rows, start=1):
-            prompt = build_prompt(row)
-            try:
-                output, elapsed = run_prompt(model_name, prompt, timeout_s)
-                latencies.append(elapsed)
-                output_lengths.append(len(output))
-            except Exception as exc:
-                failures.append({"sample_index": index, "error": str(exc)})
-        report["models"][model_name] = {
-            "summary": summarize(latencies, output_lengths),
-            "failures": failures,
+    with ThreadPoolExecutor(max_workers=min(len(model_names), 4)) as executor:
+        future_map = {
+            executor.submit(_benchmark_single_model, name, sample_rows, timeout_s): name
+            for name in model_names
         }
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                report["models"][name] = future.result()
+            except Exception as exc:
+                report["models"][name] = {
+                    "summary": {},
+                    "failures": [{"error": str(exc)}],
+                }
 
     return report
 

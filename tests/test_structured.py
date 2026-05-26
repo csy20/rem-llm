@@ -94,8 +94,9 @@ def test_execute_operations_real(tmp_path: Path):
 
 
 def test_build_structured_prompt():
-    prompt = build_structured_prompt("Add a login page", "Use Next.js App Router")
-    assert "Add a login page" in prompt
+    prompt = build_structured_prompt("Create a login page", "Use Next.js App Router")
+    assert "Add a login page" not in prompt
+    assert "Create a login page" in prompt
     assert "Next.js App Router" in prompt
     assert "operations" in prompt
     assert "action" in prompt

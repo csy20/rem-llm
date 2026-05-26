@@ -12,11 +12,14 @@ use reqwest::Client;
 use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use futures_util::StreamExt;
 use walkdir::WalkDir;
 
 mod feedback;
+mod intent;
+mod ollama;
 use feedback::FeedbackTracker;
+use intent::{classify_intent, has_creation_intent, has_file_path, intent_instruction, TaskIntent};
+use ollama::{api_url, OllamaClient, OllamaResponse};
 
 static CTRL_C_COUNT: AtomicU8 = AtomicU8::new(0);
 
@@ -39,17 +42,18 @@ fn reset_ctrlc_count() {
 
 // ── ANSI styling ───────────────────────────────────────────────────────────
 
-const C_RESET: &str = "\x1b[0m";
-const C_BOLD: &str = "\x1b[1m";
-const C_DIM: &str = "\x1b[2m";
-const C_CYAN: &str = "\x1b[36m";
-const C_GREEN: &str = "\x1b[32m";
-const C_YELLOW: &str = "\x1b[33m";
-const C_RED: &str = "\x1b[31m";
-const C_MAGENTA: &str = "\x1b[35m";
-const C_BLUE: &str = "\x1b[34m";
-const C_WHITE_B: &str = "\x1b[1;37m";
+pub const C_RESET: &str = "\x1b[0m";
+pub const C_BOLD: &str = "\x1b[1m";
+pub const C_DIM: &str = "\x1b[2m";
+pub const C_CYAN: &str = "\x1b[36m";
+pub const C_GREEN: &str = "\x1b[32m";
+pub const C_YELLOW: &str = "\x1b[33m";
+pub const C_RED: &str = "\x1b[31m";
+pub const C_MAGENTA: &str = "\x1b[35m";
+pub const C_BLUE: &str = "\x1b[34m";
+pub const C_WHITE_B: &str = "\x1b[1;37m";
 
+#[macro_export]
 macro_rules! style {
     ($color:ident, $($arg:tt)*) => {
         format!("{}{}{}", $color, format!($($arg)*), C_RESET)
@@ -383,245 +387,7 @@ fn guess_filename(lines: &[&str]) -> String {
     String::new()
 }
 
-// ── Ollama client ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct OllamaResponse { response: String }
-
-#[derive(Debug, Deserialize)]
-struct OllamaErrorResponse { error: String }
-
-#[derive(Debug, Deserialize)]
-struct TagsResponse { models: Vec<TagModel> }
-
-#[derive(Debug, Deserialize)]
-struct TagModel { name: String }
-
-struct OllamaClient {
-    client: Client,
-    base_url: String,
-    model: String,
-    system_prompt: String,
-}
-
-impl OllamaClient {
-    fn new(base_url: String, model: String, timeout_s: u64, system_prompt: String) -> Self {
-        Self {
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(timeout_s))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
-            base_url,
-            model,
-            system_prompt,
-        }
-    }
-
-    fn set_model(&mut self, model: String) { self.model = model; }
-
-    async fn list_models(&self) -> Result<Vec<String>> {
-        let url = api_url(&self.base_url, "tags");
-        let resp = self.client.get(url).send().await?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("Ollama unreachable at {}", self.base_url));
-        }
-        let parsed: TagsResponse = resp.json().await.context("invalid tags response")?;
-        Ok(parsed.models.into_iter().map(|m| m.name).collect())
-    }
-
-    async fn healthcheck(&self) -> Result<()> {
-        let models = self.list_models().await?;
-        if models.is_empty() {
-            return Err(anyhow!("Ollama reachable but no models are installed. Pull one with `ollama pull rem-coder:latest`"));
-        }
-        Ok(())
-    }
-
-    async fn complete_json(&self, user_prompt: &str) -> Result<ModelReply> {
-        let url = api_url(&self.base_url, "generate");
-        let final_prompt = format!(
-            "{}\n\nUser request:\n{}\n\nReturn JSON only.",
-            self.system_prompt, user_prompt
-        );
-        let payload = json!({
-            "model": self.model,
-            "prompt": final_prompt,
-            "stream": false,
-            "options": {
-                "num_predict": 512,
-                "num_ctx": 2048,
-                "num_thread": 4
-            },
-            "format": {
-                "type": "object",
-                "properties": {
-                    "explanation": {"type": "string"},
-                    "code": {"type": "string"},
-                    "files": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string"},
-                                "content": {"type": "string"}
-                            },
-                            "required": ["path", "content"]
-                        }
-                    },
-                    "commands": {"type": "array", "items": {"type": "string"}},
-                    "checks": {"type": "array", "items": {"type": "string"}},
-                    "caution": {"type": "string"}
-                },
-                "required": ["explanation", "code", "commands", "checks", "caution"]
-            }
-        });
-
-        let resp = self.client.post(&url).json(&payload).send().await
-            .context("failed to call Ollama")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_else(|e| format!("(read error: {})", e));
-            let err_msg = serde_json::from_str::<OllamaErrorResponse>(&body)
-                .map(|v| v.error).unwrap_or_else(|_| body.clone());
-            if status.as_u16() == 404 && err_msg.to_lowercase().contains("model") {
-                return Err(anyhow!("Model '{}' not found. Pull it: `ollama pull {}`", self.model, self.model));
-            }
-            if status.as_u16() == 404 {
-                return Err(anyhow!("Endpoint not found (404 at {}). Check --ollama-url", url));
-            }
-            return Err(anyhow!("Ollama failed: {} — {}", status, err_msg));
-        }
-
-        let raw: OllamaResponse = resp.json().await.context("invalid Ollama response")?;
-        match serde_json::from_str::<ModelReply>(raw.response.trim()) {
-            Ok(parsed) => Ok(parsed),
-            Err(e) => {
-                eprintln!("  {} JSON parse: {} — falling back", style!(C_YELLOW, "!"), e);
-                Ok(ModelReply::fallback(raw.response.trim()))
-            }
-        }
-    }
-
-    async fn complete_chat_stream(
-        &self,
-        user_prompt: &str,
-        system_prompt: &str,
-        history: &str,
-    ) -> Result<String> {
-        let url = api_url(&self.base_url, "generate");
-        let final_prompt = if history.is_empty() {
-            format!("{}\n\nUser: {}\n\nREM:", system_prompt, user_prompt)
-        } else {
-            format!("{}\n\n{}User: {}\n\nREM:", system_prompt, history, user_prompt)
-        };
-        let payload = json!({
-            "model": self.model,
-            "prompt": final_prompt,
-            "stream": true,
-            "options": {
-                "num_predict": 512,
-                "num_ctx": 2048,
-                "num_thread": 4
-            }
-        });
-        let resp = self.client.post(&url).json(&payload).send().await
-            .context("failed to call Ollama")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_else(|e| format!("(read error: {})", e));
-            let err_msg = serde_json::from_str::<OllamaErrorResponse>(&body)
-                .map(|v| v.error).unwrap_or_else(|_| body.clone());
-            if status.as_u16() == 404 && err_msg.to_lowercase().contains("model") {
-                return Err(anyhow!("Model '{}' not found. Pull it: `ollama pull {}`", self.model, self.model));
-            }
-            return Err(anyhow!("Ollama failed: {} — {}", status, err_msg));
-        }
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_clone = cancelled.clone();
-        let ctrlc_task = tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            cancelled_clone.store(true, Ordering::SeqCst);
-        });
-
-        let result = self.stream_response(resp, cancelled.clone(), ctrlc_task).await;
-        if cancelled.load(Ordering::SeqCst) {
-            println!();
-        }
-        result
-    }
-
-    async fn stream_response(
-        &self,
-        resp: reqwest::Response,
-        cancelled: Arc<AtomicBool>,
-        ctrlc_task: tokio::task::JoinHandle<()>,
-    ) -> Result<String> {
-        let mut stream = resp.bytes_stream();
-        let mut full = String::new();
-        let mut buf = String::new();
-        let start = std::time::Instant::now();
-        let mut token_count = 0u32;
-        'stream_loop: while let Some(chunk) = stream.next().await {
-            if cancelled.load(Ordering::SeqCst) {
-                ctrlc_task.abort();
-                break 'stream_loop;
-            }
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    ctrlc_task.abort();
-                    return Err(anyhow!("stream read error: {}", e));
-                }
-            };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            if buf.len() > 32_000 {
-                ctrlc_task.abort();
-                return Err(anyhow!("response too large ({} bytes buffered)", buf.len()));
-            }
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].to_string();
-                buf = buf[pos + 1..].to_string();
-                let trimmed = line.trim();
-                if trimmed.is_empty() { continue; }
-                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                    if let Some(token) = obj["response"].as_str() {
-                        if io::stdout().write_all(token.as_bytes()).is_err() {
-                            ctrlc_task.abort();
-                            break 'stream_loop;
-                        }
-                        let _ = io::stdout().flush();
-                        full.push_str(token);
-                        token_count += 1;
-                    }
-                    if obj["done"].as_bool() == Some(true) {
-                        if cancelled.load(Ordering::SeqCst) {
-                            ctrlc_task.abort();
-                            break 'stream_loop;
-                        }
-                        let elapsed = start.elapsed();
-                        let tps = if elapsed.as_secs_f64() > 0.0 {
-                            token_count as f64 / elapsed.as_secs_f64()
-                        } else { 0.0 };
-                        println!("\n  {} {:.0} tokens/s in {:.1}s",
-                            style!(C_DIM, "\u{2502}"), tps, elapsed.as_secs_f64());
-                        ctrlc_task.abort();
-                        return Ok(full);
-                    }
-                }
-            }
-        }
-        ctrlc_task.abort();
-        if cancelled.load(Ordering::SeqCst) {
-            println!("\n  {} stream cancelled — {} tokens received (Ctrl+C again to exit)",
-                style!(C_YELLOW, "\u{2502}"), token_count);
-        }
-        println!();
-        Ok(full)
-    }
-}
-
-// ── Web search ─────────────────────────────────────────────────────────────
+// ── Model reply schema ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct SearchResult {
@@ -1441,109 +1207,6 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-fn has_creation_intent(input: &str) -> bool {
-    let lower = input.to_lowercase();
-
-    let verb_phrases = [
-        "create a ", "create an ", "create the ", "create me a ", "create my ",
-        "build a ", "build an ", "build the ", "build me a ", "build my ",
-        "make a ", "make an ", "make the ", "make me a ", "make my ",
-        "generate a ", "generate an ", "generate the ", "generate me a ",
-        "scaffold a ", "scaffold an ", "scaffold the ",
-        "code a ", "code an ", "code the ", "code me a ",
-        "spin up a ", "spin up an ", "spin up the ",
-    ];
-
-    let write_objects = [
-        "write a file", "write a component", "write a function", "write a class",
-        "write a module", "write a script", "write a test", "write a handler",
-        "write a service", "write a hook", "write a config", "write a schema",
-        "write a migration", "write a seed", "write a cli", "write a tool",
-        "write an app", "write an api", "write an endpoint",
-    ];
-
-    let is_question_input = has_question_prefix(lower.as_str());
-
-    if verb_phrases.iter().any(|v| lower.starts_with(v) || lower.contains(&format!(" {}", v))) {
-        if !is_question_input {
-            return true;
-        }
-    }
-
-    if write_objects.iter().any(|w| lower.contains(w)) {
-        if !is_question_input {
-            return true;
-        }
-    }
-
-    let suffix_phrases = [
-        "a file", "an app", "a component", "a project", "a website",
-        "a script", "a page", "a module", "a class", "a function",
-        "a service", "a handler", "a hook", "a config", "a schema",
-        "a migration", "a seed", "a test", "a cli", "a tool",
-        "a layout", "a route", "an endpoint", "an api",
-    ];
-
-    for verb in [
-        "create", "build", "generate", "scaffold", "write", "code",
-        "make", "spin up",
-    ] {
-        for suffix in &suffix_phrases {
-            let combined = format!("{} {}", verb, suffix);
-            if lower.starts_with(&combined) || lower.contains(&format!(" {}", combined)) {
-                if !is_question_about(lower.as_str(), &combined) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-fn has_question_prefix(input: &str) -> bool {
-    let question_prefixes = [
-        "how to", "how do i", "how do you", "how can i", "how would you",
-        "how should i", "what is the best way to", "what's the best way to",
-        "explain how to", "tell me how to", "describe how to",
-        "show me how to", "can you explain how to", "can you show me how to",
-        "why should i", "when should i", "where should i",
-        "what is", "what are", "what does", "how does",
-        "why is", "why are", "why does",
-        "tell me about", "describe", "define",
-    ];
-    let lowered = input.to_lowercase();
-    question_prefixes.iter().any(|p| lowered.starts_with(p))
-}
-
-fn is_question_about(input: &str, action_phrase: &str) -> bool {
-    let lowered = input.to_lowercase();
-    if !lowered.contains(action_phrase) {
-        return false;
-    }
-    has_question_prefix(lowered.as_str())
-}
-
-fn has_file_path(input: &str) -> bool {
-    let lower = input.to_lowercase();
-    lower.contains(".html") || lower.contains(".css") || lower.contains(".js")
-        || lower.contains(".ts") || lower.contains(".py") || lower.contains(".rs")
-        || lower.contains(".json") || lower.contains(".toml") || lower.contains(".yaml")
-        || lower.contains(".yml") || lower.contains(".md") || lower.contains(".txt")
-        || lower.contains(".go") || lower.contains(".dart") || lower.contains(".sh")
-        || (lower.contains("/") && !lower.starts_with("http"))
-        || lower.contains("into ./") || lower.contains("into /")
-        || lower.contains("save to ") || lower.contains("save at ")
-}
-
-#[derive(Debug, PartialEq, Clone)]
-enum TaskIntent {
-    FastAnswer,
-    Planning,
-    WebNeeded,
-    CodeAction,
-}
-
 #[derive(Debug, PartialEq, Clone)]
 enum RunMode {
     Chat,
@@ -1563,98 +1226,6 @@ impl RunMode {
             RunMode::Chat => "CHAT",
             RunMode::Code => "CODE",
         }
-    }
-}
-
-fn classify_intent(input: &str) -> TaskIntent {
-    let lower = input.to_lowercase();
-
-    let web_explicit = lower.contains("search the web")
-        || lower.contains("search online")
-        || lower.contains("latest version")
-        || lower.contains("latest release")
-        || lower.contains("npm package")
-        || lower.contains("pip install")
-        || lower.contains("api docs")
-        || lower.contains("api documentation")
-        || lower.contains("stripe api")
-        || lower.contains("github repo")
-        || lower.contains("browse http")
-        || lower.contains("stack overflow")
-        || lower.contains("look up the")
-        || lower.contains("on the internet");
-
-    if web_explicit {
-        return TaskIntent::WebNeeded;
-    }
-
-    let is_question = lower.starts_with("what ")
-        || lower.starts_with("how ")
-        || lower.starts_with("why ")
-        || lower.starts_with("when ")
-        || lower.starts_with("where ")
-        || lower.starts_with("who ")
-        || lower.starts_with("can you explain")
-        || lower.starts_with("explain ")
-        || lower.starts_with("describe ")
-        || lower.starts_with("tell me ")
-        || lower.starts_with("show me ");
-
-    let plan_indicators = lower.contains("how would you")
-        || lower.contains("how should i")
-        || lower.contains("what's the best way")
-        || lower.contains("what is the best way")
-        || lower.contains("suggest an approach")
-        || lower.contains("suggest a strategy")
-        || lower.contains("design a system")
-        || lower.contains("what are the trade")
-        || lower.contains("should i use")
-        || lower.contains("would you recommend")
-        || lower.contains("is it better to")
-        || (lower.contains("how to") && lower.contains("implement"))
-        || (lower.contains("how to") && lower.contains("architect"))
-        || (lower.contains("how to") && lower.contains("design"))
-        || (lower.contains("how to") && lower.contains("structure"));
-
-    if plan_indicators && !has_creation_intent(input) {
-        return TaskIntent::Planning;
-    }
-
-    let has_create = has_creation_intent(input);
-
-    if is_question && has_create {
-        return TaskIntent::FastAnswer;
-    }
-
-    if has_create {
-        return TaskIntent::CodeAction;
-    }
-
-    let fix_indicators = lower.starts_with("fix the ")
-        || lower.starts_with("fix my ")
-        || lower.starts_with("fix this ")
-        || lower.starts_with("refactor the ")
-        || lower.starts_with("refactor my ")
-        || lower.starts_with("rename the ")
-        || lower.starts_with("delete the ")
-        || lower.starts_with("remove the ")
-        || lower.starts_with("optimize the ")
-        || lower.starts_with("update the ")
-        || lower.starts_with("update my ");
-
-    if fix_indicators && !is_question {
-        return TaskIntent::CodeAction;
-    }
-
-    TaskIntent::FastAnswer
-}
-
-fn intent_instruction(intent: &TaskIntent) -> &'static str {
-    match intent {
-        TaskIntent::FastAnswer => "\n\n[ANSWER CONCISELY — no code generation, no file format. Just a clear text response. If uncertain whether user wants code, ask first.]",
-        TaskIntent::Planning => "\n\n[PLAN FIRST — do NOT generate code. Give alternatives, trade-offs, and a recommendation. The user will tell you when to start coding.]",
-        TaskIntent::WebNeeded => "\n\n[WEB SEARCH NEEDED — tell the user to run /search <query> to get current info before you can answer accurately.]",
-        TaskIntent::CodeAction => "\n\n[USER WANTS CODE — first summarize what you'll create, then output files using the multi-file format.]",
     }
 }
 
@@ -3359,13 +2930,6 @@ fn looks_like_shell_command(line: &str) -> bool {
         | "cat" | "echo" | "rm" | "find" | "grep")
 }
 
-fn api_url(base_url: &str, endpoint: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    let ep = endpoint.trim_start_matches('/');
-    if base.ends_with("/api") { format!("{}/{}", base, ep) }
-    else { format!("{}/api/{}", base, ep) }
-}
-
 fn sanitize_commands(cmds: &[String]) -> Vec<&str> {
     let mut seen = BTreeMap::<String, ()>::new();
     let mut out = Vec::new();
@@ -3418,28 +2982,28 @@ mod tests {
 
     #[test]
     fn api_url_plain_base() {
-        assert_eq!(api_url("http://localhost:11434", "generate"), "http://localhost:11434/api/generate");
+        assert_eq!(ollama::api_url("http://localhost:11434", "generate"), "http://localhost:11434/api/generate");
     }
 
     #[test]
     fn api_url_with_api() {
-        assert_eq!(api_url("http://localhost:11434/api", "generate"), "http://localhost:11434/api/generate");
+        assert_eq!(ollama::api_url("http://localhost:11434/api", "generate"), "http://localhost:11434/api/generate");
     }
 
     #[test]
     fn detects_creation_intent() {
-        assert!(has_creation_intent("create a basic html page"));
-        assert!(has_creation_intent("build me a navbar"));
-        assert!(has_creation_intent("generate a contact form"));
-        assert!(!has_creation_intent("explain ls command"));
+        assert!(intent::has_creation_intent("create a basic html page"));
+        assert!(intent::has_creation_intent("build me a navbar"));
+        assert!(intent::has_creation_intent("generate a contact form"));
+        assert!(!intent::has_creation_intent("explain ls command"));
     }
 
     #[test]
     fn detects_file_path() {
-        assert!(has_file_path("create page at index.html"));
-        assert!(has_file_path("write to ./src/style.css"));
-        assert!(has_file_path("add this to file app.js"));
-        assert!(!has_file_path("create a basic html page"));
+        assert!(intent::has_file_path("create page at index.html"));
+        assert!(intent::has_file_path("write to ./src/style.css"));
+        assert!(intent::has_file_path("add this to file app.js"));
+        assert!(!intent::has_file_path("create a basic html page"));
     }
 
     #[test]
@@ -3514,50 +3078,50 @@ h1 { color: red; }
 
     #[test]
     fn greeting_is_fast_answer() {
-        assert_eq!(classify_intent("hii"), TaskIntent::FastAnswer);
-        assert_eq!(classify_intent("hello"), TaskIntent::FastAnswer);
-        assert_eq!(classify_intent("heyy there"), TaskIntent::FastAnswer);
-        assert_eq!(classify_intent("thanks!"), TaskIntent::FastAnswer);
+        assert_eq!(intent::classify_intent("hii"), TaskIntent::FastAnswer);
+        assert_eq!(intent::classify_intent("hello"), TaskIntent::FastAnswer);
+        assert_eq!(intent::classify_intent("heyy there"), TaskIntent::FastAnswer);
+        assert_eq!(intent::classify_intent("thanks!"), TaskIntent::FastAnswer);
     }
 
     #[test]
     fn question_about_creation_is_fast_answer() {
-        assert_eq!(classify_intent("explain how to make a file"), TaskIntent::FastAnswer);
-        assert_eq!(classify_intent("how to create a React component properly"), TaskIntent::FastAnswer);
-        assert_eq!(classify_intent("what is the best way to scaffold a project"), TaskIntent::Planning);
-        assert_eq!(classify_intent("how do I build a website from scratch"), TaskIntent::FastAnswer);
+        assert_eq!(intent::classify_intent("explain how to make a file"), TaskIntent::FastAnswer);
+        assert_eq!(intent::classify_intent("how to create a React component properly"), TaskIntent::FastAnswer);
+        assert_eq!(intent::classify_intent("what is the best way to scaffold a project"), TaskIntent::Planning);
+        assert_eq!(intent::classify_intent("how do I build a website from scratch"), TaskIntent::FastAnswer);
     }
 
     #[test]
     fn clear_creation_still_code_action() {
-        assert_eq!(classify_intent("create a React component called Button"), TaskIntent::CodeAction);
-        assert_eq!(classify_intent("make a navbar component"), TaskIntent::CodeAction);
-        assert_eq!(classify_intent("write a function to sort arrays"), TaskIntent::CodeAction);
+        assert_eq!(intent::classify_intent("create a React component called Button"), TaskIntent::CodeAction);
+        assert_eq!(intent::classify_intent("make a navbar component"), TaskIntent::CodeAction);
+        assert_eq!(intent::classify_intent("write a function to sort arrays"), TaskIntent::CodeAction);
     }
 
     #[test]
     fn fix_is_still_code_action() {
-        assert_eq!(classify_intent("fix the bug in auth middleware"), TaskIntent::CodeAction);
-        assert_eq!(classify_intent("refactor the user service"), TaskIntent::CodeAction);
+        assert_eq!(intent::classify_intent("fix the bug in auth middleware"), TaskIntent::CodeAction);
+        assert_eq!(intent::classify_intent("refactor the user service"), TaskIntent::CodeAction);
     }
 
     #[test]
     fn has_creation_intent_regression() {
-        assert!(has_creation_intent("create a file called index.html"));
-        assert!(has_creation_intent("build me a website"));
-        assert!(has_creation_intent("make a component"));
-        assert!(!has_creation_intent("explain how to create a file"));
-        assert!(!has_creation_intent("how do i make a test"));
-        assert!(!has_creation_intent("hii"));
-        assert!(!has_creation_intent("what is the best way to build a project"));
+        assert!(intent::has_creation_intent("create a file called index.html"));
+        assert!(intent::has_creation_intent("build me a website"));
+        assert!(intent::has_creation_intent("make a component"));
+        assert!(!intent::has_creation_intent("explain how to create a file"));
+        assert!(!intent::has_creation_intent("how do i make a test"));
+        assert!(!intent::has_creation_intent("hii"));
+        assert!(!intent::has_creation_intent("what is the best way to build a project"));
     }
 
     #[test]
     fn is_question_about_works() {
-        assert!(is_question_about("how to create a file", "create a file"));
-        assert!(is_question_about("explain how to make a component", "make a component"));
-        assert!(!is_question_about("create a file now", "create a file"));
-        assert!(!is_question_about("how should i", "create a file"));
+        assert!(intent::is_question_about("how to create a file", "create a file"));
+        assert!(intent::is_question_about("explain how to make a component", "make a component"));
+        assert!(!intent::is_question_about("create a file now", "create a file"));
+        assert!(!intent::is_question_about("how should i", "create a file"));
     }
 
     #[test]

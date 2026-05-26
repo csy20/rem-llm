@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: install deps
+        run: |
+          pip install -e ".[dev]"
+          pip install ruff pyright
+
+      - name: lint (ruff)
+        run: ruff check src/ tests/ scripts/
+
+      - name: type check (pyright)
+        run: pyright src/ || true
+
+      - name: test
+        run: pytest tests/ -v --tb=short
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: fmt check
+        working-directory: rem-cli
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        working-directory: rem-cli
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: build
+        working-directory: rem-cli
+        run: cargo build --release

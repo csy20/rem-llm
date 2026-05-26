@@ -146,9 +146,12 @@ class QualityEvaluator(Evaluator):
         model_name: str,
         rows: list[dict],
         timeout_s: Optional[int] = None,
+        **kwargs,
     ) -> EvalReport:
         if not rows:
             raise ValueError("No eval rows provided")
+
+        max_workers = kwargs.get("max_workers", 1)
 
         aggregates = {
             "non_empty": 0,
@@ -161,36 +164,80 @@ class QualityEvaluator(Evaluator):
         language_breakdown: dict[str, dict] = {}
         samples = []
 
-        for row in rows:
-            prompt = row["instruction"]
-            if row.get("input"):
-                prompt = f"{prompt}\n\nContext:\n{row['input']}"
-            response = run_prompt_ollama(model_name, prompt, timeout_s=timeout_s)
-            metrics = score_response(row, response)
+        if max_workers > 1:
+            from remllm.eval.base import evaluate_concurrent
 
-            for key in aggregates:
-                aggregates[key] += metrics[key]
-
-            lang = metrics["language"]
-            if lang not in language_breakdown:
-                language_breakdown[lang] = {
-                    "count": 0,
-                    "syntax_ok": 0,
-                    "quality_score": 0.0,
-                }
-            language_breakdown[lang]["count"] += 1
-            language_breakdown[lang]["syntax_ok"] += metrics["syntax_ok"]
-            language_breakdown[lang]["quality_score"] += metrics["quality_score"]
-
-            samples.append(
-                {
+            def process_row(model: str, row: dict, _timeout: int) -> dict:
+                prompt = row["instruction"]
+                if row.get("input"):
+                    prompt = f"{prompt}\n\nContext:\n{row['input']}"
+                response = run_prompt_ollama(model, prompt, timeout_s=_timeout)
+                metrics = score_response(row, response)
+                return {
                     "instruction": row["instruction"],
                     "input": row.get("input", ""),
                     "reference_excerpt": str(row.get("output", ""))[:300],
                     "response_excerpt": response[:500],
                     "metrics": metrics,
                 }
+
+            raw_samples = evaluate_concurrent(
+                model_name,
+                rows,
+                process_row,
+                max_workers=max_workers,
+                timeout_s=timeout_s or 300,
             )
+            for s in raw_samples:
+                metrics = s.get("metrics", {})
+                if not metrics:
+                    continue
+                for key in aggregates:
+                    aggregates[key] += metrics.get(key, 0)
+                lang = metrics.get("language", "unknown")
+                if lang not in language_breakdown:
+                    language_breakdown[lang] = {
+                        "count": 0,
+                        "syntax_ok": 0,
+                        "quality_score": 0.0,
+                    }
+                language_breakdown[lang]["count"] += 1
+                language_breakdown[lang]["syntax_ok"] += metrics.get("syntax_ok", 0)
+                language_breakdown[lang]["quality_score"] += metrics.get(
+                    "quality_score", 0.0
+                )
+                samples.append(s)
+        else:
+            for row in rows:
+                prompt = row["instruction"]
+                if row.get("input"):
+                    prompt = f"{prompt}\n\nContext:\n{row['input']}"
+                response = run_prompt_ollama(model_name, prompt, timeout_s=timeout_s)
+                metrics = score_response(row, response)
+
+                for key in aggregates:
+                    aggregates[key] += metrics[key]
+
+                lang = metrics["language"]
+                if lang not in language_breakdown:
+                    language_breakdown[lang] = {
+                        "count": 0,
+                        "syntax_ok": 0,
+                        "quality_score": 0.0,
+                    }
+                language_breakdown[lang]["count"] += 1
+                language_breakdown[lang]["syntax_ok"] += metrics["syntax_ok"]
+                language_breakdown[lang]["quality_score"] += metrics["quality_score"]
+
+                samples.append(
+                    {
+                        "instruction": row["instruction"],
+                        "input": row.get("input", ""),
+                        "reference_excerpt": str(row.get("output", ""))[:300],
+                        "response_excerpt": response[:500],
+                        "metrics": metrics,
+                    }
+                )
 
         total = len(rows)
         language_rates = {}

@@ -261,61 +261,8 @@ def build_structured_prompt(
     profile: "Optional[TaskProfile]" = None,
     codebase_context: str = "",
 ) -> str:
-    if profile is not None:
-        return _build_adaptive_prompt(task, context, profile, codebase_context)
+    from remllm.context.adaptive import build_adaptive_prompt, classify_task
 
-    from remllm.context.adaptive import classify_task
-
-    profile = classify_task(task)
-    return _build_adaptive_prompt(task, context, profile, codebase_context)
-
-
-def _build_adaptive_prompt(
-    task: str,
-    context: str,
-    profile: "TaskProfile",
-    codebase_context: str = "",
-) -> str:
-    from remllm.context.adaptive import ToolNeed
-
-    if profile.fast_path:
-        prompt = PROMPT_CHAT_BASE
-        prompt += f"\n\nUser: {task}"
-        if codebase_context:
-            prompt += f"\n\nRelevant codebase context:\n{codebase_context}"
-        return prompt
-
-    needs_web = profile.needs(ToolNeed.WEB_SEARCH)
-    needs_create = profile.needs(ToolNeed.FILE_CREATE)
-    needs_modify = profile.needs(ToolNeed.FILE_MODIFY)
-    needs_codebase = profile.needs(ToolNeed.CODEBASE_SEARCH)
-
-    if needs_web and not needs_create and not needs_modify:
-        prompt = PROMPT_WEB_SEARCH
-    elif needs_create and not needs_modify and not needs_web:
-        prompt = PROMPT_CREATE_ONLY
-    elif needs_modify and not needs_create:
-        prompt = PROMPT_MODIFY_ONLY
-    elif needs_codebase and not (needs_create or needs_modify):
-        prompt = PROMPT_CODEBASE
-    else:
-        prompt = PROMPT_GENERAL
-
-    if profile.needs_llm_classification and not profile.fast_path:
-        prefix = (
-            "[ATTENTION] The intent of this request is ambiguous. "
-            "If this is a question/conversation, answer in text. "
-            "Only generate code/files if the user clearly asked for them.\n\n"
-        )
-        prompt = prefix + prompt
-
-    if codebase_context:
-        prompt = (
-            f"Relevant code from the project:\n```\n{codebase_context}\n```\n\n{prompt}"
-        )
-
-    prompt += f"\n\nTask: {task}"
-    if context:
-        prompt += f"\n\nContext:\n{context}"
-    prompt += "\n\nRespond with only the JSON output."
-    return prompt
+    if profile is None:
+        profile = classify_task(task)
+    return build_adaptive_prompt(task, context, codebase_context, profile)

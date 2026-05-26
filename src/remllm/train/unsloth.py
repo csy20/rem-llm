@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+import torch
 import yaml
 
 from remllm.data.loader import format_training_row, load_jsonl

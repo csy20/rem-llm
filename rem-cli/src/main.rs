@@ -190,6 +190,8 @@ struct AppConfig {
     timeout_s: u64,
     max_context_bytes: usize,
     prompts_dir: Option<String>,
+    #[serde(default)]
+    workspace_dir: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -200,6 +202,7 @@ impl Default for AppConfig {
             timeout_s: 120,
             max_context_bytes: 16_000,
             prompts_dir: None,
+            workspace_dir: None,
         }
     }
 }
@@ -211,6 +214,7 @@ struct PartialConfig {
     timeout_s: Option<u64>,
     max_context_bytes: Option<usize>,
     prompts_dir: Option<String>,
+    workspace_dir: Option<String>,
 }
 
 impl AppConfig {
@@ -220,7 +224,68 @@ impl AppConfig {
         if let Some(v) = part.timeout_s { self.timeout_s = v; }
         if let Some(v) = part.max_context_bytes { self.max_context_bytes = v; }
         if let Some(v) = part.prompts_dir { self.prompts_dir = Some(v); }
+        if let Some(v) = part.workspace_dir { self.workspace_dir = Some(v); }
     }
+}
+
+fn save_config(cfg: &AppConfig) -> Result<()> {
+    if let Some(home) = dirs::home_dir() {
+        let dir = home.join(".config/rem-cli");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("config.toml");
+        let text = toml::to_string_pretty(cfg).context("failed to serialize config")?;
+        fs::write(&path, text).context("failed to write config")?;
+    }
+    Ok(())
+}
+
+fn first_run_setup(cfg: &mut AppConfig) -> Result<Option<PathBuf>> {
+    println!();
+    println!("{} {}", style!(C_BOLD, "Welcome to REM!"), style!(C_DIM, "first-time setup"));
+    println!();
+    println!("{}", style!(C_CYAN, "│"));
+    println!("{} {}{}",
+        style!(C_CYAN, "│"), style!(C_WHITE_B, "Where should REM create your projects?"), style!(C_DIM, ""));
+    println!("{} {} e.g. {} or {}",
+        style!(C_CYAN, "│"), style!(C_DIM, ""),
+        style!(C_WHITE_B, "~/projects"), style!(C_WHITE_B, "/home/you/code"));
+    println!("{} {} type {} for current dir, or a full path", style!(C_CYAN, "│"), style!(C_DIM, ""), style!(C_WHITE_B, "."));
+    println!("{}", style!(C_CYAN, "│"));
+    print!("{}", style!(C_CYAN, "│  rem> "));
+    let _ = io::stdout().flush();
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+
+    let dir = if trimmed.is_empty() || trimmed == "." {
+        std::env::current_dir().unwrap_or_default()
+    } else if trimmed.starts_with("~/") || trimmed == "~" {
+        if let Some(home) = dirs::home_dir() {
+            home.join(trimmed.trim_start_matches("~/"))
+        } else {
+            PathBuf::from(trimmed)
+        }
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    if !dir.exists() {
+        println!("{} creating {}...", style!(C_CYAN, "│"), dir.display());
+        fs::create_dir_all(&dir)?;
+    }
+
+    cfg.workspace_dir = Some(dir.to_string_lossy().to_string());
+    save_config(cfg)?;
+
+    println!("{} {} workspace saved to {}",
+        style!(C_GREEN, "│  ✓"), style!(C_DIM, ""),
+        style!(C_WHITE_B, "{}", dir.display()));
+    println!("{} {} change it anytime with {}",
+        style!(C_CYAN, "│"), style!(C_DIM, ""), style!(C_WHITE_B, "/dir <path>"));
+    println!();
+
+    Ok(Some(dir))
 }
 
 // ── Model reply schema ─────────────────────────────────────────────────────
@@ -479,13 +544,14 @@ struct ChatSession {
     last_intent: TaskIntent,
     last_user_input: String,
     project_dir: Option<PathBuf>,
+    workspace_dir: Option<PathBuf>,
     history: Vec<(String, String)>,
     feedback: FeedbackTracker,
     mode: RunMode,
 }
 
 impl ChatSession {
-    fn new(model: &str) -> Result<Self> {
+    fn new(model: &str, workspace: Option<PathBuf>) -> Result<Self> {
         let rl = DefaultEditor::new().context("failed to start line editor")?;
         Ok(Self {
             rl,
@@ -495,7 +561,8 @@ impl ChatSession {
             last_search: Vec::new(),
             last_intent: TaskIntent::FastAnswer,
             last_user_input: String::new(),
-            project_dir: None,
+            project_dir: workspace.clone(),
+            workspace_dir: workspace,
             history: Vec::new(),
             feedback: FeedbackTracker::new(model),
             mode: RunMode::Chat,
@@ -624,15 +691,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let verbose = cli.verbose;
 
-    if let Some(Commands::New(args)) = cli.command {
-        return run_new(args);
-    }
-
-    check_system_resources();
-
     let mut cfg = load_config().unwrap_or_default();
     if let Some(m) = cli.model { cfg.model = m; }
     if let Some(url) = cli.ollama_url { cfg.ollama_url = url; }
+
+    if let Some(Commands::New(args)) = cli.command {
+        return run_new(args, &cfg);
+    }
 
     let system_prompt = load_system_prompt(cfg.prompts_dir.as_deref());
     let mut client = OllamaClient::new(
@@ -651,7 +716,7 @@ async fn main() -> Result<()> {
         Some(Commands::Explain(args)) => run_explain(&client, args).await,
         Some(Commands::Patch(args))   => run_patch(&client, &cfg, args).await,
         Some(Commands::New(_))        => unreachable!(),
-        None                          => run_chat(&client, verbose).await,
+        None                          => run_chat(&client, &mut cfg, verbose).await,
     }
 }
 
@@ -908,10 +973,28 @@ fn build_prompt(session: &ChatSession, client: &OllamaClient) -> String {
     p
 }
 
-async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
+async fn run_chat(client: &OllamaClient, cfg: &mut AppConfig, verbose: bool) -> Result<()> {
     reset_ctrlc_count();
-    let mut session = ChatSession::new(&client.model)?;
+
+    let workspace = if let Some(ref dir) = cfg.workspace_dir {
+        let path = PathBuf::from(dir);
+        if !path.exists() {
+            fs::create_dir_all(&path)?;
+        }
+        Some(path)
+    } else {
+        first_run_setup(cfg)?
+    };
+
+    let mut session = ChatSession::new(&client.model, workspace.clone())?;
     print_welcome(client);
+    if let Some(ref wd) = workspace {
+        println!("{} {} {}",
+            style!(C_CYAN, "│"),
+            style!(C_DIM, "workspace →"),
+            style!(C_WHITE_B, "{}", wd.display()));
+        println!("{}", style!(C_CYAN, "│"));
+    }
 
     loop {
         let prompt = build_prompt(&session, client);
@@ -965,6 +1048,21 @@ async fn run_chat(client: &OllamaClient, verbose: bool) -> Result<()> {
 
         if let Some(tail) = trimmed.strip_prefix("/search ") {
             handle_search(client, &mut session, tail.trim()).await;
+            continue;
+        }
+
+        if let Some(tail) = trimmed.strip_prefix("/explain ") {
+            handle_explain(client, &mut session, tail.trim()).await;
+            continue;
+        }
+
+        if let Some(tail) = trimmed.strip_prefix("/test ") {
+            handle_test(client, &mut session, tail.trim()).await;
+            continue;
+        }
+
+        if let Some(tail) = trimmed.strip_prefix("/refactor ") {
+            handle_refactor(client, &mut session, tail.trim()).await;
             continue;
         }
 
@@ -1275,11 +1373,15 @@ fn strip_code_blocks(text: &str) -> String {
 }
 
 fn prompt_for_path(session: &mut ChatSession) -> io::Result<String> {
+    let workspace_display = session.project_dir.as_ref()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| "current dir".to_string());
     println!("{}", style!(C_CYAN, "│"));
     println!("{} {}",
         style!(C_MAGENTA, "│  ?"),
         style!(C_WHITE_B, "Where should I create this? (e.g. ./my-site/index.html or ./project/)"));
-    println!("{} {}", style!(C_MAGENTA, "│"), style!(C_DIM, "  type '.' for current dir, or /dir <path> to set a project root"));
+    println!("{} {} workspace: {}", style!(C_MAGENTA, "│"), style!(C_DIM, ""), style!(C_WHITE_B, "{}", workspace_display));
+    println!("{} {} type '.' for workspace root, or /dir <path> to change", style!(C_MAGENTA, "│"), style!(C_DIM, ""));
     println!("{}", style!(C_CYAN, "│"));
 
     loop {
@@ -1630,19 +1732,32 @@ fn print_last_files(session: &ChatSession) {
 
 fn handle_dir(session: &mut ChatSession, path: &str) {
     let dir = PathBuf::from(path.trim());
-    if dir.exists() || path.trim() == "." {
-        session.project_dir = Some(if path.trim() == "." { std::env::current_dir().unwrap_or_default() } else { dir });
-        println!("  {} project root set to {}",
+    let resolved = if path.trim() == "." { std::env::current_dir().unwrap_or_default() } else { dir };
+    if resolved.exists() || path.trim() == "." {
+        session.project_dir = Some(resolved.clone());
+        session.workspace_dir = Some(resolved.clone());
+        persist_workspace(&resolved);
+        println!("  {} workspace set to {}",
             style!(C_GREEN, "✓"), style!(C_WHITE_B, "{}", session.project_dir.as_ref().unwrap().display()));
     } else {
         println!("  {} directory does not exist — creating it", style!(C_YELLOW, "!"));
-        if let Err(e) = fs::create_dir_all(&dir) {
+        if let Err(e) = fs::create_dir_all(&resolved) {
             println!("  {} failed: {}", style!(C_RED, "✗"), e);
             return;
         }
-        session.project_dir = Some(dir);
-        println!("  {} project root set to {}",
+        session.project_dir = Some(resolved.clone());
+        session.workspace_dir = Some(resolved.clone());
+        persist_workspace(&resolved);
+        println!("  {} workspace set to {}",
             style!(C_GREEN, "✓"), style!(C_WHITE_B, "{}", session.project_dir.as_ref().unwrap().display()));
+    }
+}
+
+fn persist_workspace(dir: &Path) {
+    let mut cfg = load_config().unwrap_or_default();
+    cfg.workspace_dir = Some(dir.to_string_lossy().to_string());
+    if let Err(e) = save_config(&cfg) {
+        eprintln!("  {} failed to save workspace config: {}", style!(C_RED, "✗"), e);
     }
 }
 
@@ -1664,6 +1779,116 @@ async fn handle_search(client: &OllamaClient, session: &mut ChatSession, query: 
     }
 }
 
+async fn handle_explain(client: &OllamaClient, session: &mut ChatSession, text: &str) {
+    if text.trim().is_empty() {
+        println!("{} usage: /explain <code snippet>", style!(C_YELLOW, "│"));
+        return;
+    }
+    println!("{} explaining...", style!(C_CYAN, "\u{2502}"));
+    let prompt = format!(
+        "Explain what the following code does in clear, plain language. \
+         Be concise but thorough. Cover: purpose, key components, control flow. \
+         Do NOT generate new code. Just explain.\n\nCode:\n```\n{}\n```",
+        text
+    );
+    match client.complete_chat_stream(
+        &prompt,
+        "[MODE: CHAT] You are a code explainer. Respond with plain text only — no code generation, no file format, no JSON.",
+        "",
+    ).await {
+        Ok(response) => {
+            println!("\n{}", response);
+            session.add_history(&format!("/explain {}", text));
+            session.history.push((format!("/explain {}", text), response));
+        }
+        Err(e) => {
+            println!("\n{} explain failed: {}", style!(C_RED, "│"), e);
+        }
+    }
+}
+
+async fn handle_test(client: &OllamaClient, session: &mut ChatSession, path: &str) {
+    let file_path = Path::new(path.trim());
+    if !file_path.exists() {
+        println!("{} file not found: {}", style!(C_YELLOW, "│"), path);
+        return;
+    }
+    let content = match fs::read_to_string(file_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("{} cannot read file: {}", style!(C_RED, "│"), e);
+            return;
+        }
+    };
+    println!("{} generating tests for {}...", style!(C_CYAN, "\u{2502}"), path);
+    let prompt = format!(
+        "Generate comprehensive tests for the following code. \
+         Include unit tests for all public functions/methods, edge cases, \
+         and error handling. Write tests in the same language and testing \
+         framework conventions.\n\nSource code:\n```\n{}\n```",
+        truncate_to_lines(&content, 200)
+    );
+    match client.complete_chat_stream(
+        &prompt,
+        "[MODE: CODE] Generate test code for the given source file. Respond with the test code in a fenced code block.",
+        "",
+    ).await {
+        Ok(response) => {
+            println!();
+            println!("{}", response);
+            session.last_code = extract_code_block(&response);
+            session.add_history(&format!("/test {}", path));
+            session.history.push((format!("/test {}", path), response));
+            if !session.last_code.is_empty() {
+                println!("{} tests ready — use {} to save",
+                    style!(C_GREEN, "│"),
+                    style!(C_WHITE_B, "/write <path>"));
+            }
+        }
+        Err(e) => {
+            println!("\n{} test generation failed: {}", style!(C_RED, "│"), e);
+        }
+    }
+}
+
+async fn handle_refactor(client: &OllamaClient, session: &mut ChatSession, path: &str) {
+    let file_path = Path::new(path.trim());
+    if !file_path.exists() {
+        println!("{} file not found: {}", style!(C_YELLOW, "│"), path);
+        return;
+    }
+    let content = match fs::read_to_string(file_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("{} cannot read file: {}", style!(C_RED, "│"), e);
+            return;
+        }
+    };
+    println!("{} analyzing {} for refactoring...", style!(C_CYAN, "\u{2502}"), path);
+    let prompt = format!(
+        "Review the following code and suggest refactoring improvements. \
+         Consider: code clarity, DRY principle, performance, error handling, \
+         naming, structure. Give specific recommendations with before/after \
+         code examples where helpful.\n\nSource code:\n```\n{}\n```",
+        truncate_to_lines(&content, 200)
+    );
+    match client.complete_chat_stream(
+        &prompt,
+        "[MODE: CHAT] You are a code reviewer. Analyze the code and provide refactoring suggestions. Use clear markdown formatting.",
+        "",
+    ).await {
+        Ok(response) => {
+            println!();
+            println!("{}", response);
+            session.add_history(&format!("/refactor {}", path));
+            session.history.push((format!("/refactor {}", path), response));
+        }
+        Err(e) => {
+            println!("\n{} refactor analysis failed: {}", style!(C_RED, "│"), e);
+        }
+    }
+}
+
 fn print_chat_help() {
     let v = C_CYAN;
     let d = C_DIM;
@@ -1672,6 +1897,9 @@ fn print_chat_help() {
     println!("{}  {}{}", style!(v, "\u{2502}"), style!(h, "\u{2500}\u{2500} COMMANDS \u{2500}\u{2500}"), style!(d, ""));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/help"),          style!(d, "show this help"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/mode"),          style!(d, "toggle CHAT ↔ CODE mode"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/explain <code>"),style!(d, "explain what code does"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/test <file>"),   style!(d, "generate tests for a file"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/refactor <file>"),style!(d, "suggest refactoring for a file"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/write <path>"),  style!(d, "save last code to file"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/save <path>"),   style!(d, "same as /write"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/dir <path>"),    style!(d, "set project root"));
@@ -1686,6 +1914,8 @@ fn print_chat_help() {
     println!("{}   {} use {} to toggle between chat and code modes", style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "/mode"));
     println!("{}   {} describe what you want \u{2014} REM detects intent", style!(v, "\u{2502}"), style!(d, "\u{2022}"));
     println!("{}   {} multi-file intent and auto-writes after confirmation", style!(v, "\u{2502}"), style!(d, "\u{2022}"));
+    println!("{}   {} use {} {} {} for analysis, tests, and refactoring",
+        style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "/explain"), style!(h, "/test"), style!(h, "/refactor"));
     println!("{}   {} run {} to scaffold a new project instantly", style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "rem new <name>"));
     println!("{}", style!(v, "\u{2502}"));
 }
@@ -1825,12 +2055,20 @@ fn truncate_bytes(s: &str, max: usize) -> String {
 
 // ── Project scaffolding ────────────────────────────────────────────────────
 
-fn run_new(args: NewArgs) -> Result<()> {
-    let dir = PathBuf::from(&args.name);
+fn run_new(args: NewArgs, cfg: &AppConfig) -> Result<()> {
+    let dir = if args.name.starts_with('/') || args.name.starts_with("./") || args.name.starts_with("../") {
+        PathBuf::from(&args.name)
+    } else if let Some(ref ws) = cfg.workspace_dir {
+        let base = PathBuf::from(ws);
+        base.join(&args.name)
+    } else {
+        PathBuf::from(&args.name)
+    };
+
     if dir.exists() {
         return Err(anyhow!(
             "Directory '{}' already exists. Choose a different name.",
-            args.name
+            dir.display()
         ));
     }
 

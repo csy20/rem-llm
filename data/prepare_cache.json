@@ -1,6 +1,6 @@
 {
   "fingerprint": {
-    "raw_file": "/tmp/tmpaqbcgvno/data/raw.jsonl",
+    "raw_file": "/tmp/tmp_fwh3i4c/data/raw.jsonl",
     "raw_sha256": "1d85f5df58a8ec834944c4d4765f5a1269dec3462514a5aa241691cfd8f13b14",
     "seed": 42,
     "train_split": 0.8,
@@ -9,7 +9,7 @@
       "input",
       "output"
     ],
-    "schema_version": 1
+    "schema_version": 2
   },
   "stats": {
     "raw_rows": 3,

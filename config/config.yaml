@@ -6,6 +6,7 @@ model:
   base_model_hf: "deepseek-ai/deepseek-coder-1.3b-base"
   base_model_ollama: "deepseek-coder:1.3b"
   output_name: "rem-coder"
+  teacher_model: "deepseek-coder:6.7b"
 
 data:
   raw_file: "data/raw.jsonl"
@@ -13,13 +14,20 @@ data:
   val_file: "data/val.jsonl"
   eval_file: "data/eval.jsonl"
   train_split: 0.9
-  max_length: 2048
+  max_length: 4096
   pack_sequences: true
+  rope_scaling: false
+  rope_scaling_factor: 2.0
+  rope_scaling_type: "linear"
+  deduplicate: true
+  perplexity_filter: false
+  perplexity_threshold: 5.0
 
 training:
   backend: "unsloth"
   output_dir: "models/rem-coder-lora"
   merged_output_dir: "models/rem-coder-merged"
+  grpo_output_dir: "models/rem-coder-grpo"
   epochs: 2
   learning_rate: 0.00012
   per_device_train_batch_size: 2
@@ -32,6 +40,16 @@ training:
   lora_alpha: 64
   lora_dropout: 0.05
   load_in_4bit: true
+  train_on_responses_only: true
+  chat_template: true
+  fim_training: false
+  fim_rate: 0.8
+  dynamic_quantization: false
+  offload_gradient_checkpointing: false
+  curriculum: false
+  curriculum_stages: ["easy", "intermediate", "advanced"]
+  save_total_limit: 3
+  logging_steps: 10
 
 evaluation:
   baseline_report: "models/evals/baseline.json"

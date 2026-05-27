@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from remllm import __version__
+from remllm.agent import run_agent
 from remllm.config import resolve_project_root
 from remllm.data.loader import load_jsonl
 from remllm.data.prepper import prepare_data
@@ -45,15 +46,46 @@ def cmd_data_prepare(args: argparse.Namespace) -> None:
 
 def cmd_data_generate(args: argparse.Namespace) -> None:
     from remllm.data.generator import (
+        ANALYSIS_TEMPLATES,
+        BACKEND_TEMPLATES,
         BEGINNER_TEMPLATES,
+        CONVERSATION_TEMPLATES,
+        DEVOPS_TEMPLATES,
+        LANG_TEMPLATES,
+        MOBILE_TEMPLATES,
         NEXTJS_TEMPLATES,
+        generate_conversation_dataset,
         generate_dataset,
         write_dataset,
     )
 
-    templates = NEXTJS_TEMPLATES + BEGINNER_TEMPLATES
+    if args.domain == "conversation":
+        rows = generate_conversation_dataset(CONVERSATION_TEMPLATES, seed=args.seed)
+        write_dataset(rows, Path(args.output))
+        print(f"Generated {len(rows)} conversation examples -> {args.output}")
+        return
+
+    templates = (
+        NEXTJS_TEMPLATES
+        + BEGINNER_TEMPLATES
+        + BACKEND_TEMPLATES
+        + DEVOPS_TEMPLATES
+        + MOBILE_TEMPLATES
+        + ANALYSIS_TEMPLATES
+        + LANG_TEMPLATES
+    )
     if args.domain == "beginner":
         templates = BEGINNER_TEMPLATES
+    elif args.domain == "nextjs":
+        templates = NEXTJS_TEMPLATES
+    elif args.domain == "backend":
+        templates = BACKEND_TEMPLATES
+    elif args.domain == "devops":
+        templates = DEVOPS_TEMPLATES
+    elif args.domain == "mobile":
+        templates = MOBILE_TEMPLATES
+    elif args.domain == "analysis":
+        templates = ANALYSIS_TEMPLATES
     elif args.domain != "all":
         templates = [t for t in templates if t.domain == args.domain]
     rows = generate_dataset(templates, seed=args.seed)
@@ -69,6 +101,68 @@ def cmd_data_generate(args: argparse.Namespace) -> None:
     print("Distribution:")
     for domain, s in sorted(stats.items()):
         print(f"  {domain}: {s['count']} rows — {s['diffs']}")
+
+
+def cmd_data_dedup(args: argparse.Namespace) -> None:
+    from remllm.data.dedup import deduplicate
+
+    deduplicate(
+        Path(args.input),
+        Path(args.output),
+        near_dedup=args.near,
+        threshold=args.threshold,
+    )
+
+
+def cmd_data_filter(args: argparse.Namespace) -> None:
+    from remllm.data.filter import filter_by_perplexity
+
+    filter_by_perplexity(
+        Path(args.input),
+        Path(args.output),
+        model=args.model,
+        threshold=args.threshold,
+        max_samples=args.max_samples,
+        timeout_s=args.timeout_s,
+    )
+
+
+def cmd_data_mix(args: argparse.Namespace) -> None:
+    from remllm.data.mixer import mix_datasets
+
+    datasets = {}
+    for pair in args.datasets.split(","):
+        if ":" in pair:
+            name, path = pair.split(":", 1)
+            datasets[name.strip()] = Path(path.strip())
+    ratios = {}
+    if args.ratios:
+        for pair in args.ratios.split(","):
+            if ":" in pair:
+                name, ratio = pair.split(":", 1)
+                ratios[name.strip()] = float(ratio.strip())
+    mix_datasets(
+        datasets,
+        ratios,
+        Path(args.output),
+        target_size=args.target_size,
+        seed=args.seed,
+    )
+
+
+def cmd_data_augment(args: argparse.Namespace) -> None:
+    from remllm.data.augment import augment_dataset
+
+    augment_dataset(
+        Path(args.input), Path(args.output), factor=args.factor, seed=args.seed
+    )
+
+
+def cmd_data_scrape(args: argparse.Namespace) -> None:
+    from remllm.data.scraper import scrape
+
+    sources = [s.strip() for s in args.sources.split(",")]
+    scrape(sources, Path(args.output), language=args.language, count=args.count)
 
 
 def cmd_eval_quality(args: argparse.Namespace) -> None:
@@ -161,6 +255,25 @@ def cmd_train(args: argparse.Namespace) -> None:
     train_unsloth(Path(args.config))
 
 
+def cmd_train_grpo(args: argparse.Namespace) -> None:
+    from remllm.train.grpo import train_grpo
+
+    train_grpo(Path(args.config))
+
+
+def cmd_train_distill(args: argparse.Namespace) -> None:
+    from remllm.train.distill import distill_dataset
+
+    distill_dataset(
+        Path(args.input),
+        Path(args.output),
+        teacher_model=args.teacher,
+        student_model=args.student,
+        temperature=args.temperature,
+        max_samples=args.max_samples,
+    )
+
+
 def cmd_merge(args: argparse.Namespace) -> None:
     from remllm.export.merge import merge_adapter
 
@@ -179,6 +292,106 @@ def cmd_package(args: argparse.Namespace) -> None:
     from remllm.export.ollama import package_ollama
 
     package_ollama(args.model_name, Path(args.gguf_file), Path(args.modelfile))
+
+
+def cmd_agent(args: argparse.Namespace) -> None:
+    project_dir = Path(args.project_dir) if args.project_dir else None
+    index_path = Path(args.index_path) if args.index_path else None
+
+    result = run_agent(
+        task=args.task,
+        model=args.model,
+        project_dir=project_dir,
+        index_path=index_path,
+        dry_run=not args.execute,
+        timeout_s=args.timeout_s,
+    )
+
+    print(f"\n{'=' * 60}")
+    print(
+        f"Profile: {json.dumps(result.profile.to_dict() if result.profile else {}, indent=2)}"
+    )
+    print(f"Codebase chunks: {result.codebase_chunks}")
+    print(f"\n--- Raw Response (first 500 chars) ---")
+    print(result.raw_response[:500])
+
+    if result.structured:
+        print(f"\n--- Structured Plan ---")
+        print(result.structured.plan)
+        if result.structured.operations:
+            print(
+                f"\n--- File Operations ({'DRY RUN' if not args.execute else 'EXECUTED'}) ---"
+            )
+            for op in result.file_ops:
+                print(f"  {op}")
+        if result.structured.tool_calls:
+            print(f"\n--- Tool Calls ---")
+            for tc in result.structured.tool_calls:
+                print(f"  {tc.name}: {json.dumps(tc.arguments)}")
+
+    summary_path = Path(args.summary) if args.summary else None
+    if summary_path:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            json.dumps(result.to_dict(), indent=2), encoding="utf-8"
+        )
+        print(f"\nSummary written to {summary_path}")
+
+
+def cmd_index(args: argparse.Namespace) -> None:
+    project_dir = Path(args.project_dir)
+    index_path = Path(args.index_path)
+    if args.chromadb:
+        from remllm.indexing import index_to_chromadb
+
+        count = index_to_chromadb(project_dir, str(index_path))
+        print(f"Indexed {count} chunks to ChromaDB at {index_path}")
+    else:
+        from remllm.context.indexer import index_codebase
+
+        indexer = index_codebase(project_dir, index_path)
+        if args.query:
+            chunks = indexer.retrieve(args.query, top_k=args.top_k)
+            if not chunks:
+                print("No relevant code chunks found.")
+            else:
+                for chunk in chunks:
+                    print(
+                        f"\n--- {chunk.path}:{chunk.start_line} ({chunk.chunk_type}: {chunk.name}) ---"
+                    )
+                    print(chunk.content[:500])
+            print(f"\nRetrieved {len(chunks)} chunks from {len(indexer.chunks)} total")
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    from remllm.context.indexer import CodebaseIndexer
+
+    indexer = CodebaseIndexer(Path(args.index_path))
+    chunks = indexer.retrieve(args.query, top_k=args.top_k)
+    if not chunks:
+        print("No relevant code chunks found.")
+        return
+    if args.raw:
+        for chunk in chunks:
+            print(
+                json.dumps(
+                    {
+                        "path": chunk.path,
+                        "name": chunk.name,
+                        "chunk_type": chunk.chunk_type,
+                        "start_line": chunk.start_line,
+                        "content": chunk.content[:300],
+                    },
+                    indent=2,
+                )
+            )
+    else:
+        for i, chunk in enumerate(chunks, 1):
+            print(
+                f"\n[{i}] {chunk.path}:{chunk.start_line} ({chunk.chunk_type}: {chunk.name})"
+            )
+            print(chunk.content[:500])
+    print(f"\nRetrieved {len(chunks)} chunks")
 
 
 def cmd_pipeline(args: argparse.Namespace) -> None:
@@ -289,17 +502,84 @@ def main():
         default="all",
         choices=[
             "all",
+            "analysis",
+            "ansible",
+            "backend",
             "beginner",
-            "nextjs",
-            "react",
-            "prisma",
-            "typescript",
-            "html",
+            "cicd",
+            "conversation",
+            "csharp",
             "css",
+            "devops",
+            "docker",
+            "express",
+            "fastapi",
+            "flask",
+            "flutter",
+            "go",
+            "html",
+            "java",
+            "kotlin",
+            "kubernetes",
+            "mobile",
+            "nextjs",
+            "php",
+            "prisma",
+            "python",
+            "react",
+            "ruby",
+            "rust",
+            "swift",
             "terminal",
+            "typescript",
+            "vue",
         ],
     )
     dp_gen.add_argument("--seed", type=int, default=42)
+    dp_dedup = dp_sub.add_parser("dedup", help="Deduplicate dataset rows")
+    dp_dedup.add_argument("input", help="Input JSONL path")
+    dp_dedup.add_argument("--output", required=True, help="Output JSONL path")
+    dp_dedup.add_argument(
+        "--near", action="store_true", help="Enable near-deduplication"
+    )
+    dp_dedup.add_argument(
+        "--threshold", type=float, default=0.85, help="Jaccard threshold for near-dedup"
+    )
+    dp_filter = dp_sub.add_parser("filter", help="Filter by perplexity/quality score")
+    dp_filter.add_argument("input", help="Input JSONL path")
+    dp_filter.add_argument("--output", required=True, help="Output JSONL path")
+    dp_filter.add_argument("--model", default="deepseek-coder:1.3b")
+    dp_filter.add_argument(
+        "--threshold", type=float, default=5.0, help="Minimum quality score"
+    )
+    dp_filter.add_argument(
+        "--max-samples", type=int, default=0, help="Max samples to score"
+    )
+    dp_filter.add_argument("--timeout-s", type=int, default=60)
+    dp_mix = dp_sub.add_parser(
+        "mix", help="Mix multiple datasets with weighted sampling"
+    )
+    dp_mix.add_argument(
+        "--datasets", required=True, help="Comma-separated name:path pairs"
+    )
+    dp_mix.add_argument("--ratios", default="", help="Comma-separated name:ratio pairs")
+    dp_mix.add_argument("--output", required=True, help="Output JSONL path")
+    dp_mix.add_argument("--target-size", type=int, default=0)
+    dp_mix.add_argument("--seed", type=int, default=42)
+    dp_aug = dp_sub.add_parser("augment", help="Augment dataset with code variations")
+    dp_aug.add_argument("input", help="Input JSONL path")
+    dp_aug.add_argument("--output", required=True, help="Output JSONL path")
+    dp_aug.add_argument("--factor", type=int, default=3, help="Augmentation factor")
+    dp_aug.add_argument("--seed", type=int, default=42)
+    dp_scrape = dp_sub.add_parser("scrape", help="Scrape code from public sources")
+    dp_scrape.add_argument(
+        "--sources", default="github_trending", help="Comma-separated source names"
+    )
+    dp_scrape.add_argument("--language", default="python", help="Programming language")
+    dp_scrape.add_argument("--count", type=int, default=10, help="Number of results")
+    dp_scrape.add_argument(
+        "--output", default="data/scraped.jsonl", help="Output JSONL path"
+    )
 
     # eval
     eq = sub.add_parser("eval", help="Evaluation operations")
@@ -361,8 +641,19 @@ def main():
     cmp.add_argument("--post-exec", default="")
 
     # train
-    tr = sub.add_parser("train", help="Run QLoRA training")
-    tr.add_argument("--config", default="config/config.yaml")
+    tr = sub.add_parser("train", help="Run training")
+    tr_sub = tr.add_subparsers(dest="train_command")
+    tr_qlora = tr_sub.add_parser("qlora", help="Run QLoRA training")
+    tr_qlora.add_argument("--config", default="config/config.yaml")
+    tr_grpo = tr_sub.add_parser("grpo", help="Run GRPO reasoning training")
+    tr_grpo.add_argument("--config", default="config/config.yaml")
+    tr_distill = tr_sub.add_parser("distill", help="Run knowledge distillation")
+    tr_distill.add_argument("input", help="Input JSONL with instructions")
+    tr_distill.add_argument("--output", required=True, help="Output JSONL path")
+    tr_distill.add_argument("--teacher", default="deepseek-coder:6.7b")
+    tr_distill.add_argument("--student", default="deepseek-coder:1.3b")
+    tr_distill.add_argument("--temperature", type=float, default=2.0)
+    tr_distill.add_argument("--max-samples", type=int, default=100)
 
     # merge
     mg = sub.add_parser("merge", help="Merge LoRA adapter into base model")
@@ -387,6 +678,43 @@ def main():
     )
     pkg.add_argument("--modelfile", default="Modelfile.trained")
 
+    # index
+    idx = sub.add_parser("index", help="Index codebase for semantic search")
+    idx.add_argument("project_dir", help="Project directory to index")
+    idx.add_argument(
+        "--index-path",
+        default="models/codebase_index.json",
+        help="Output index JSON path",
+    )
+    idx.add_argument(
+        "--query", default=None, help="Optional query to search after indexing"
+    )
+    idx.add_argument("--top-k", type=int, default=5, help="Number of results for query")
+    idx.add_argument("--chromadb", action="store_true", help="Use ChromaDB backend")
+
+    # search
+    sr = sub.add_parser("search", help="Search indexed codebase")
+    sr.add_argument("query", help="Search query")
+    sr.add_argument(
+        "--index-path", default="models/codebase_index.json", help="Index JSON path"
+    )
+    sr.add_argument("--top-k", type=int, default=5, help="Number of results")
+    sr.add_argument("--raw", action="store_true", help="Output raw JSON")
+
+    # agent
+    ag = sub.add_parser("agent", help="Run coding agent with structured output")
+    ag.add_argument("task", help="Task description for the agent")
+    ag.add_argument("--model", default="deepseek-coder:1.3b")
+    ag.add_argument("--project-dir", default=None, help="Project directory to index")
+    ag.add_argument("--index-path", default=None, help="Path to codebase index JSON")
+    ag.add_argument("--timeout-s", type=int, default=120)
+    ag.add_argument(
+        "--execute",
+        action="store_true",
+        help="Execute file operations (default: dry-run)",
+    )
+    ag.add_argument("--summary", default=None, help="Write summary JSON to path")
+
     # pipeline
     pl = sub.add_parser("pipeline", help="Run full 7-phase pipeline")
     pl.add_argument("--config", default="config/config.yaml")
@@ -402,6 +730,11 @@ def main():
         "data": lambda a: {
             "prepare": cmd_data_prepare,
             "generate": cmd_data_generate,
+            "dedup": cmd_data_dedup,
+            "filter": cmd_data_filter,
+            "mix": cmd_data_mix,
+            "augment": cmd_data_augment,
+            "scrape": cmd_data_scrape,
         }.get(str(getattr(a, "data_command", "") or ""), lambda _: dp.print_help())(a),
         "eval": lambda a: {
             "quality": cmd_eval_quality,
@@ -413,7 +746,14 @@ def main():
             "benchmark": cmd_eval_benchmark,
         }.get(str(getattr(a, "eval_command", "") or ""), lambda _: eq.print_help())(a),
         "compare": cmd_compare,
-        "train": cmd_train,
+        "index": cmd_index,
+        "search": cmd_search,
+        "agent": cmd_agent,
+        "train": lambda a: {
+            "qlora": cmd_train,
+            "grpo": cmd_train_grpo,
+            "distill": cmd_train_distill,
+        }.get(str(getattr(a, "train_command", "") or "qlora"), cmd_train)(a),
         "merge": cmd_merge,
         "export": lambda a: {"gguf": cmd_export_gguf}.get(
             str(getattr(a, "export_command", "") or ""), lambda _: ex.print_help()

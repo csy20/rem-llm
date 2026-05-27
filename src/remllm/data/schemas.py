@@ -7,6 +7,8 @@ class TrainingRow(BaseModel):
     instruction: str
     input: str = ""
     output: str
+    difficulty: str = "easy"
+    domain: str = "general"
 
 
 class EvalRow(BaseModel):
@@ -38,3 +40,32 @@ class WebTrainingRow(BaseModel):
     domain: str = "general"
     difficulty: str = "easy"
     tags: list[str] = Field(default_factory=list)
+
+
+class ConversationTurn(BaseModel):
+    role: str
+    content: str
+
+
+class ConversationRow(BaseModel):
+    turns: list[ConversationTurn] = Field(default_factory=list)
+    domain: str = "general"
+    difficulty: str = "easy"
+    tags: list[str] = Field(default_factory=list)
+
+
+class FIMRow(BaseModel):
+    prefix: str
+    suffix: str = ""
+    middle: str
+    domain: str = "general"
+    difficulty: str = "easy"
+
+
+class SafetyRow(BaseModel):
+    instruction: str
+    output: str
+    refusal: bool = True
+    category: str = "general"
+    domain: str = "safety"
+    difficulty: str = "easy"

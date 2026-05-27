@@ -85,7 +85,7 @@ def test_build_dataset_fingerprint(temp_jsonl):
     fp = build_dataset_fingerprint(temp_jsonl, 42, 0.9)
     assert fp["seed"] == 42
     assert fp["train_split"] == 0.9
-    assert fp["schema_version"] == 1
+    assert fp["schema_version"] == 2
     assert "raw_sha256" in fp
 
 

@@ -22,9 +22,11 @@ It is designed for:
 - beginner-safe terminal command guidance
 - patch preview workflows with file context
 - **Three interactive modes**: CHAT (conversation), CODE (generation), PLAN (analysis)
-- **Slash commands**: `/help`, `/mode`, `/plan`, `/clear`, `/explain`, `/test`, `/refactor`, `/write`, `/save`, `/dir`, `/search`, `/code`, `/files`, `/undo`, `/diff`, `/tokens`, `/config`, `/why`
-
-Quick install (recommended):
+- **30+ slash commands**: `/help`, `/mode`, `/plan`, `/clear`, `/reset`, `/explain`, `/test`, `/refactor`, `/write`, `/save`, `/dir`, `/search`, `/code`, `/files`, `/undo`, `/diff`, `/tokens`, `/config`, `/why`, `/init`, `/memory`, `/compact`, `/goal`, `/copy`, `/lint`, `/review`, `/resume`
+- **`@` references**: `fix @src/main.rs` injects file/directory context inline
+- **Persistent memory**: `.rem/memory.md` with auto-generation via `/init`
+- **Pipe mode**: `git diff | rem` for non-interactive analysis
+- **Autonomous loop**: `/goal <condition>` keeps working until done
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/csy20/rem-llm/main/install.sh | bash

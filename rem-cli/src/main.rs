@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -16,9 +16,11 @@ use walkdir::WalkDir;
 
 mod feedback;
 mod intent;
+mod memory;
 mod ollama;
 use feedback::FeedbackTracker;
 use intent::{classify_intent, has_creation_intent, has_file_path, intent_instruction, TaskIntent};
+use memory::ProjectMemory;
 use ollama::{api_url, OllamaClient, OllamaResponse};
 
 static CTRL_C_COUNT: AtomicU8 = AtomicU8::new(0);
@@ -564,11 +566,14 @@ struct ChatSession {
     mode: RunMode,
     last_tokens: u32,
     last_elapsed: std::time::Duration,
+    project_memory: ProjectMemory,
 }
 
 impl ChatSession {
     fn new(model: &str, workspace: Option<PathBuf>) -> Result<Self> {
         let rl = DefaultEditor::new().context("failed to start line editor")?;
+        let project_dir = workspace.clone();
+        let project_memory = ProjectMemory::load(project_dir.as_deref().unwrap_or_else(|| Path::new(".")));
         Ok(Self {
             rl,
             last_code: String::new(),
@@ -584,6 +589,7 @@ impl ChatSession {
             mode: RunMode::Chat,
             last_tokens: 0,
             last_elapsed: std::time::Duration::from_secs(0),
+            project_memory,
         })
     }
 
@@ -624,6 +630,66 @@ impl ChatSession {
             out.push_str(&format!("User: {}\nREM: {}\n\n", user, truncated_assistant));
         }
         out
+    }
+
+    fn build_memory_context(&self) -> String {
+        self.project_memory.as_context()
+    }
+
+    fn resolve_at_references(&self, input: &str) -> (String, String) {
+        let re = Regex::new(r"@([^\s]+)").expect("invalid regex literal");
+        let mut extra_context = String::new();
+        let mut cleaned_input = input.to_string();
+
+        for cap in re.captures_iter(input) {
+            let ref_path = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            if ref_path.starts_with("http") { continue; }
+            let path = if ref_path.starts_with('/') || ref_path.starts_with("~/") {
+                let resolved = if ref_path.starts_with("~/") {
+                    if let Some(home) = dirs::home_dir() {
+                        home.join(ref_path.trim_start_matches("~/"))
+                    } else {
+                        PathBuf::from(ref_path)
+                    }
+                } else {
+                    PathBuf::from(ref_path)
+                };
+                resolved
+            } else {
+                let base = self.project_dir.as_deref().unwrap_or_else(|| Path::new("."));
+                base.join(ref_path)
+            };
+
+            if path.is_file() {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let truncated = truncate_bytes(&content, 8000);
+                    extra_context.push_str(&format!("\n[File: {}]\n{}\n[/File: {}]\n",
+                        path.display(), truncated, path.display()));
+                }
+            } else if path.is_dir() {
+                let mut listing = String::new();
+                for entry in WalkDir::new(&path).max_depth(2).sort_by_file_name() {
+                    if let Ok(e) = entry {
+                        if let Ok(rel) = e.path().strip_prefix(&path) {
+                            let rel_str = rel.display().to_string();
+                            if rel_str.is_empty() || rel_str.starts_with('.') { continue; }
+                            if rel_str.contains("node_modules") || rel_str.contains("target") || rel_str.contains("__pycache__") || rel_str.contains(".git") { continue; }
+                            let marker = if e.file_type().is_dir() { "/" } else { "" };
+                            listing.push_str(&format!("  {}{}\n", rel_str, marker));
+                        }
+                    }
+                }
+                if !listing.is_empty() {
+                    let total = listing.lines().count();
+                    extra_context.push_str(&format!("\n[Directory: {} ({} entries)]\n{}[/Directory: {}]\n",
+                        path.display(), total, listing, path.display()));
+                }
+            }
+
+            cleaned_input = cleaned_input.replace(&format!("@{}", ref_path), ref_path);
+        }
+
+        (cleaned_input, extra_context)
     }
 }
 
@@ -734,7 +800,16 @@ async fn main() -> Result<()> {
         Some(Commands::Explain(args)) => run_explain(&client, args).await,
         Some(Commands::Patch(args))   => run_patch(&client, &cfg, args).await,
         Some(Commands::New(_))        => unreachable!(),
-        None                          => run_chat(&client, &mut cfg, verbose).await,
+        None => {
+            let is_pipe = !atty::is(atty::Stream::Stdin);
+            if is_pipe {
+                let mut stdin_data = String::new();
+                if io::stdin().read_to_string(&mut stdin_data).is_ok() && !stdin_data.trim().is_empty() {
+                    return run_pipe(&client, &cfg, stdin_data.trim(), verbose).await;
+                }
+            }
+            run_chat(&client, &mut cfg, verbose).await
+        }
     }
 }
 
@@ -774,6 +849,31 @@ fn load_system_prompt(custom_prompts_dir: Option<&str>) -> String {
         }
     }
     DEFAULT_SYSTEM_PROMPT.to_string()
+}
+
+async fn run_pipe(client: &OllamaClient, _cfg: &AppConfig, input: &str, verbose: bool) -> Result<()> {
+    let prompt = if input.len() > 12000 {
+        format!("Analyze the following piped input. Be concise.\n\n{}...\n[truncated]", &input[..12000])
+    } else {
+        format!("Analyze the following piped input. Be concise.\n\n{}", input)
+    };
+    let _spinner = SpinnerGuard::new("thinking...");
+    let result = client.complete_chat_stream(
+        &prompt,
+        "[MODE: CHAT] You are in pipe/non-interactive mode. Respond concisely. No code generation unless explicitly asked.",
+        "",
+    ).await;
+    match result {
+        Ok(text) => {
+            if verbose {
+                eprintln!("\n  {} raw:\n{}\n", style!(C_DIM, "verbose:"), text);
+            }
+            println!();
+            println!("{}", text.trim());
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ── Subcommand handlers ────────────────────────────────────────────────────
@@ -1164,6 +1264,94 @@ async fn run_chat(client: &OllamaClient, cfg: &mut AppConfig, verbose: bool) -> 
             continue;
         }
 
+        if trimmed.eq_ignore_ascii_case("/memory") {
+            handle_memory(&session);
+            continue;
+        }
+        if let Some(tail) = trimmed.strip_prefix("/memory ") {
+            handle_memory_set(&mut session, tail.trim());
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("/init") {
+            handle_init(&mut session);
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("/compact") {
+            handle_compact(client, &mut session).await;
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("/reset") {
+            session.history.clear();
+            session.last_search.clear();
+            session.last_tokens = 0;
+            session.last_code.clear();
+            session.last_files.clear();
+            session.last_files_written.clear();
+            println!("{}", style!(C_DIM, "│"));
+            println!("{} {}", style!(C_CYAN, "│"), style!(C_GREEN, "full reset — history, code cache, and results cleared"));
+            println!("{}   {} {}",
+                style!(C_CYAN, "│"), style!(C_DIM, "│"), style!(C_DIM, "(memory preserved — use /memory to clear project memory)"));
+            println!("{}", style!(C_DIM, "│"));
+            continue;
+        }
+
+        if let Some(tail) = trimmed.strip_prefix("/goal ") {
+            handle_goal(client, &mut session, tail.trim()).await;
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("/copy") || trimmed == "/copy 1" {
+            handle_copy(&session, 1);
+            continue;
+        }
+        if let Some(tail) = trimmed.strip_prefix("/copy ") {
+            if let Ok(n) = tail.trim().parse::<usize>() {
+                handle_copy(&session, n);
+            } else {
+                println!("{} usage: /copy [N] — N is a number", style!(C_YELLOW, "│"));
+            }
+            continue;
+        }
+
+        if let Some(tail) = trimmed.strip_prefix("/lint ") {
+            handle_lint(&mut session, tail.trim());
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("/lint") {
+            if session.last_files.is_empty() && session.last_files_written.is_empty() {
+                println!("{} no files to lint. Generate code first.", style!(C_YELLOW, "│"));
+            } else {
+                let paths: Vec<String> = if !session.last_files_written.is_empty() {
+                    session.last_files_written.iter().map(|p| p.display().to_string()).collect()
+                } else {
+                    session.last_files.iter().filter(|f| !f.path.is_empty()).map(|f| f.path.clone()).collect()
+                };
+                for p in paths {
+                    handle_lint(&mut session, &p);
+                }
+            }
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("/review") {
+            handle_review(client, &mut session).await;
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("/save") && !trimmed.starts_with("/save ") {
+            handle_save_session(&session);
+            continue;
+        }
+
+        if trimmed.eq_ignore_ascii_case("/resume") {
+            handle_resume_session(&mut session);
+            continue;
+        }
+
         if trimmed.eq_ignore_ascii_case("/why") {
             let intent_name = match session.last_intent {
                 TaskIntent::FastAnswer => "chat/question",
@@ -1229,13 +1417,21 @@ async fn run_chat(client: &OllamaClient, cfg: &mut AppConfig, verbose: bool) -> 
         let search_ctx = session.build_search_context();
         let project_ctx = session.build_project_context();
         let history_ctx = session.build_chat_history();
+        let memory_ctx = session.build_memory_context();
+        let (resolved_input, at_context) = session.resolve_at_references(&final_prompt);
         let full_prompt = {
             let mut p = instruction.to_string();
             p.push('\n');
+            if !memory_ctx.is_empty() {
+                p.push_str(&memory_ctx);
+            }
             if !project_ctx.is_empty() {
                 p.push_str(&project_ctx);
             }
-            p.push_str(&final_prompt);
+            if !at_context.is_empty() {
+                p.push_str(&at_context);
+            }
+            p.push_str(&resolved_input);
             if !search_ctx.is_empty() {
                 p.push_str(&search_ctx);
             }
@@ -2122,6 +2318,348 @@ fn handle_tokens(session: &ChatSession) {
     println!("{}", style!(C_DIM, "\u{2502}"));
 }
 
+fn handle_memory(session: &ChatSession) {
+    println!("{}", style!(C_DIM, "\u{2502}"));
+    println!("{}  {}{}", style!(C_CYAN, "\u{2502}"), style!(C_WHITE_B, "\u{2500}\u{2500} MEMORY \u{2500}\u{2500}"), style!(C_DIM, ""));
+    if session.project_memory.loaded && !session.project_memory.content.is_empty() {
+        for line in session.project_memory.content.lines() {
+            println!("{} {}", style!(C_CYAN, "\u{2502}"), style!(C_DIM, "{}", line));
+        }
+    } else {
+        println!("{} {} {}", style!(C_CYAN, "\u{2502}"), style!(C_DIM, "no project memory yet."), style!(C_DIM, ""));
+        println!("{} {} {}", style!(C_CYAN, "\u{2502}"), style!(C_DIM, ""), style!(C_DIM, "use /init to generate, or /memory add <text>"));
+    }
+    println!("{}", style!(C_DIM, "\u{2502}"));
+    println!("{} {} {}",
+        style!(C_CYAN, "\u{2502}"), style!(C_DIM, ""), style!(C_DIM, "/memory add <text>  /init  /memory clear"));
+    println!("{}", style!(C_CYAN, "\u{2502}"));
+}
+
+fn handle_memory_set(session: &mut ChatSession, args: &str) {
+    if args.eq_ignore_ascii_case("clear") {
+        session.project_memory.content.clear();
+        session.project_memory.loaded = false;
+        let _ = session.project_memory.save();
+        println!("{} memory cleared", style!(C_GREEN, "✓"));
+        return;
+    }
+    if let Some(text) = args.strip_prefix("add ") {
+        if let Err(e) = session.project_memory.append(text) {
+            println!("{} failed: {}", style!(C_RED, "✗"), e);
+        } else {
+            println!("{} appended to memory ({} bytes)", style!(C_GREEN, "✓"), text.len());
+        }
+        return;
+    }
+    if let Err(e) = session.project_memory.set(args) {
+        println!("{} failed: {}", style!(C_RED, "✗"), e);
+    } else {
+        println!("{} memory saved ({} bytes)", style!(C_GREEN, "✓"), args.len());
+    }
+}
+
+fn handle_init(session: &mut ChatSession) {
+    let dir = session.project_dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let ptype = detect_project_type(&dir);
+    let ptype_label = if ptype.is_empty() { "unknown" } else { ptype };
+    println!("{}", style!(C_DIM, "│"));
+    println!("{} {}", style!(C_CYAN, "│"), style!(C_WHITE_B, "detected project type: {}", ptype_label));
+    println!("{} {}", style!(C_CYAN, "│"), style!(C_DIM, "generating .rem/memory.md..."));
+    let starter = ProjectMemory::generate_starter(&dir, ptype);
+    if let Err(e) = session.project_memory.set(&starter) {
+        println!("{} {} failed: {}", style!(C_RED, "│"), style!(C_RED, "✗"), e);
+    } else {
+        println!("{} {} {} ({} bytes)", style!(C_GREEN, "│"), style!(C_GREEN, "✓"), style!(C_WHITE_B, ".rem/memory.md created"), starter.len());
+        println!("{} {} use {} to view", style!(C_CYAN, "│"), style!(C_DIM, ""), style!(C_WHITE_B, "/memory"));
+    }
+    println!("{}", style!(C_DIM, "│"));
+}
+
+async fn handle_compact(client: &OllamaClient, session: &mut ChatSession) {
+    if session.history.is_empty() {
+        println!("{} nothing to compact — history is empty", style!(C_YELLOW, "│"));
+        return;
+    }
+    let history_text = session.build_chat_history();
+    let compact_prompt = format!(
+        "[SYSTEM] Summarize this conversation in 3-5 bullet points covering key decisions, code generated, and next actions. Be concise.\n\n{}",
+        history_text
+    );
+    println!("{} compacting {} turns...", style!(C_CYAN, "│"), session.history.len());
+    match client.complete_chat_stream(&compact_prompt, "You are a summarizer. Output only bullet-point summary. No preamble, no code.", "").await {
+        Ok(summary) => {
+            let old_count = session.history.len();
+            session.history.clear();
+            session.history.push(("[compacted summary]".to_string(), summary.trim().to_string()));
+            println!("{} {} {} → {} turns", style!(C_GREEN, "│"), style!(C_GREEN, "✓ compacted:"), old_count, session.history.len());
+        }
+        Err(e) => {
+            println!("{} {} compact failed: {}", style!(C_RED, "│"), style!(C_RED, "✗"), e);
+        }
+    }
+}
+
+async fn handle_goal(client: &OllamaClient, session: &mut ChatSession, condition: &str) {
+    println!("{}", style!(C_DIM, "│"));
+    println!("{} {} {}", style!(C_CYAN, "│"), style!(C_WHITE_B, "GOAL: {}", condition), style!(C_DIM, ""));
+    println!("{} {} {}", style!(C_CYAN, "│"), style!(C_DIM, ""), style!(C_DIM, "REM will work until goal is met. Ctrl+C to stop."));
+    println!("{}", style!(C_DIM, "│"));
+
+    let goal_prompt_text = format!(
+        "GOAL: {}\n\nYour task is to achieve this goal. You may need to:\n\
+         1. Plan your approach\n\
+         2. Write code/files\n\
+         3. Test and verify\n\
+         4. Fix any issues\n\n\
+         When you believe the goal is achieved, say GOAL_ACHIEVED: <summary>.\n\
+         If you are stuck, say GOAL_FAILED: <reason>.",
+        condition
+    );
+
+    let max_iter = 10;
+    for i in 0..max_iter {
+        if i > 0 {
+            println!("{}", style!(C_DIM, "│"));
+        }
+        println!("{} {} {}/{}",
+            style!(C_CYAN, "│"), style!(C_BOLD, "iteration"), i + 1, max_iter);
+
+        match client.complete_chat_stream(&goal_prompt_text, &CHAT_SYSTEM_PROMPT_CODE, "").await {
+            Ok(text) => {
+                let cleaned = text.trim().to_string();
+                session.history.push((format!("/goal {}", condition), cleaned.clone()));
+
+                let files = extract_code_blocks_with_names(&cleaned);
+                let code = extract_code_block(&cleaned);
+                if !files.is_empty() {
+                    session.last_files = files.clone();
+                    session.last_code = if code.is_empty() { String::new() } else { code };
+                    auto_write_files(session, &files);
+                } else if !code.is_empty() {
+                    session.last_code = code;
+                    session.last_files.clear();
+                    println!("{} {} use /write <path> to save",
+                        style!(C_CYAN, "│"), style!(C_DIM, "code detected —"));
+                }
+
+                if cleaned.contains("GOAL_ACHIEVED") {
+                    println!("{} {} goal achieved!", style!(C_GREEN, "│"), style!(C_GREEN, "✓"));
+                    break;
+                }
+                if cleaned.contains("GOAL_FAILED") {
+                    println!("{} {} goal could not be achieved.", style!(C_YELLOW, "│"), style!(C_YELLOW, "!"));
+                    break;
+                }
+            }
+            Err(e) => {
+                println!("{} {} error: {}", style!(C_RED, "│"), style!(C_RED, "✗"), e);
+                break;
+            }
+        }
+    }
+    println!("{}", style!(C_DIM, "│"));
+}
+
+fn handle_copy(session: &ChatSession, n: usize) {
+    let response = if n == 1 || session.history.is_empty() {
+        session.history.last().map(|(_, a)| a.as_str()).unwrap_or("")
+    } else {
+        let total = session.history.len();
+        if n > total {
+            println!("{} only {} responses in history", style!(C_YELLOW, "│"), total);
+            return;
+        }
+        session.history.get(total - n).map(|(_, a)| a.as_str()).unwrap_or("")
+    };
+
+    if response.is_empty() {
+        println!("{} nothing to copy", style!(C_YELLOW, "│"));
+        return;
+    }
+
+    let use_clipboard = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("printf '%s' {:?} | xclip -selection clipboard 2>/dev/null || printf '%s' {:?} | xsel --clipboard 2>/dev/null || printf '%s' {:?} | pbcopy 2>/dev/null || echo 'no-clipboard'", response, response, response))
+        .output();
+
+    match use_clipboard {
+        Ok(out) if String::from_utf8_lossy(&out.stdout).contains("no-clipboard") => {
+            println!("{} copied to console:", style!(C_GREEN, "│ ✓"));
+            println!("{}", style!(C_DIM, "│"));
+            for line in response.lines().take(20) {
+                println!("{} {}", style!(C_DIM, "│"), line);
+            }
+            if response.lines().count() > 20 {
+                println!("{} ... ({} lines total)", style!(C_DIM, "│"), response.lines().count());
+            }
+        }
+        Ok(_) => {
+            println!("{} copied to clipboard ({} chars)", style!(C_GREEN, "│ ✓"), response.len());
+        }
+        Err(_) => {
+            println!("{} copied to console ({}) — install xclip/xsel for clipboard", style!(C_GREEN, "│ ✓"), response.chars().count());
+            for line in response.lines().take(20) {
+                println!("{} {}", style!(C_DIM, "│"), line);
+            }
+        }
+    }
+}
+
+fn handle_lint(_session: &mut ChatSession, path: &str) {
+    let file_path = Path::new(path);
+    if !file_path.exists() {
+        println!("{} file not found: {}", style!(C_YELLOW, "│"), path);
+        return;
+    }
+
+    let path_str = file_path.display().to_string();
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let cmd: (&str, Vec<String>) = match ext {
+        "py" => ("python3", vec!["-m".into(), "py_compile".into(), path_str.clone()]),
+        "rs" => ("cargo", vec!["fmt".into(), "--check".into(), "--".into()]),
+        "go" => ("go", vec!["fmt".into()]),
+        "js" | "ts" => ("npx", vec!["--no-install".into(), "eslint".into(), path_str.clone()]),
+        "html" => ("npx", vec!["--no-install".into(), "htmlhint".into(), path_str.clone()]),
+        "css" => ("npx", vec!["--no-install".into(), "stylelint".into(), path_str.clone()]),
+        _ => {
+            println!("{} no linter configured for .{} files", style!(C_YELLOW, "│"), ext);
+            return;
+        }
+    };
+
+    println!("{} linting {}...", style!(C_CYAN, "│"), path);
+    let output = std::process::Command::new(cmd.0)
+        .args(&cmd.1)
+        .output();
+
+    match output {
+        Ok(out) => {
+            if out.status.success() {
+                println!("{} {} passed lint", style!(C_GREEN, "│ ✓"), path);
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let msg = if stderr.trim().is_empty() { stdout.trim().to_string() } else { stderr.trim().to_string() };
+                if msg.is_empty() {
+                    println!("{} {} lint completed with warnings", style!(C_YELLOW, "│ !"), path);
+                } else {
+                    println!("{} {} lint issues:", style!(C_YELLOW, "│ !"), path);
+                    for line in msg.lines().take(10) {
+                        println!("{}   {}", style!(C_YELLOW, "│"), line);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            println!("{} lint failed: {} (is the tool installed?)", style!(C_YELLOW, "│"), e);
+        }
+    }
+}
+
+async fn handle_review(client: &OllamaClient, session: &mut ChatSession) {
+    if session.last_files.is_empty() {
+        println!("{} no generated code to review", style!(C_YELLOW, "│"));
+        return;
+    }
+
+    let mut code_for_review = String::new();
+    for f in &session.last_files {
+        if f.path.is_empty() { continue; }
+        code_for_review.push_str(&format!("\n### {}\n```\n{}\n```\n", f.path, truncate_bytes(&f.content, 3000)));
+    }
+    if code_for_review.is_empty() && !session.last_code.is_empty() {
+        code_for_review = format!("```\n{}\n```", truncate_bytes(&session.last_code, 3000));
+    }
+    if code_for_review.is_empty() {
+        println!("{} no code to review", style!(C_YELLOW, "│"));
+        return;
+    }
+
+    let review_prompt = format!(
+        "Review the following code for:\n\
+         1. Bugs & correctness issues\n\
+         2. Code smells & anti-patterns\n\
+         3. Security vulnerabilities\n\
+         4. Missing error handling\n\
+         5. Style & naming improvements\n\n\
+         Be specific — reference line numbers where possible.\n\n{}",
+        code_for_review
+    );
+
+    println!("{} reviewing {} file(s)...", style!(C_CYAN, "│"), session.last_files.len());
+    match client.complete_chat_stream(
+        &review_prompt,
+        "[MODE: CHAT] You are a senior code reviewer. Review the code critically. Use clear markdown. Be specific.",
+        "",
+    ).await {
+        Ok(response) => {
+            println!();
+            println!("{}", response);
+            session.history.push(("/review".to_string(), response));
+        }
+        Err(e) => {
+            println!("\n{} review failed: {}", style!(C_RED, "│"), e);
+        }
+    }
+}
+
+fn handle_save_session(session: &ChatSession) {
+    let dir = session.project_dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let rem_dir = dir.join(".rem");
+    let _ = fs::create_dir_all(&rem_dir);
+    let session_file = rem_dir.join("session.json");
+    let data = serde_json::json!({
+        "history": session.history.iter().map(|(u, a)| serde_json::json!({"user": u, "assistant": a})).collect::<Vec<_>>(),
+        "mode": session.mode.label(),
+        "workspace": session.project_dir.as_ref().map(|d| d.display().to_string()),
+        "saved_at": chrono_now(),
+    });
+    match fs::write(&session_file, serde_json::to_string_pretty(&data).unwrap_or_default()) {
+        Ok(()) => println!("{} session saved to {}", style!(C_GREEN, "✓"), session_file.display()),
+        Err(e) => println!("{} failed to save session: {}", style!(C_RED, "✗"), e),
+    }
+}
+
+fn chrono_now() -> String {
+    std::process::Command::new("date")
+        .arg("+%Y-%m-%d %H:%M:%S")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn handle_resume_session(session: &mut ChatSession) {
+    let dir = session.project_dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let session_file = dir.join(".rem/session.json");
+    if !session_file.exists() {
+        println!("{} no saved session found at {}", style!(C_YELLOW, "│"), session_file.display());
+        return;
+    }
+    match fs::read_to_string(&session_file) {
+        Ok(content) => {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(history) = data["history"].as_array() {
+                    let mut restored = 0;
+                    for entry in history {
+                        if let (Some(u), Some(a)) = (entry["user"].as_str(), entry["assistant"].as_str()) {
+                            session.history.push((u.to_string(), a.to_string()));
+                            restored += 1;
+                        }
+                    }
+                    println!("{} restored {} turns from {}", style!(C_GREEN, "✓"), restored, session_file.display());
+                    println!("{} current conversation is now merged with saved session", style!(C_DIM, "│"));
+                    if let Some(m) = data["mode"].as_str() {
+                        println!("{} {} {}", style!(C_DIM, "│"), style!(C_DIM, "saved mode:"), style!(C_WHITE_B, "{}", m));
+                    }
+                }
+            } else {
+                println!("{} invalid session file", style!(C_RED, "│"));
+            }
+        }
+        Err(e) => println!("{} failed to read session: {}", style!(C_RED, "│"), e),
+    }
+}
+
 fn print_chat_help() {
     let v = C_CYAN;
     let d = C_DIM;
@@ -2145,16 +2683,29 @@ fn print_chat_help() {
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/diff"),          style!(d, "compare generated vs existing files"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/tokens"),        style!(d, "show token usage & context stats"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/config"),        style!(d, "view current configuration"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/memory"),        style!(d, "view/set project memory (.rem/memory.md)"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/init"),          style!(d, "auto-generate project memory file"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/compact"),       style!(d, "summarize & free context window"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/goal <cond>"),   style!(d, "autonomous loop until goal is met"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/copy [N]"),      style!(d, "copy last response to clipboard"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/lint [file]"),   style!(d, "run linter on generated files"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/review"),        style!(d, "AI code review of generated code"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/reset"),         style!(d, "full reset — clear history & code cache"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/save"),          style!(d, "save current session to .rem/session.json"));
+    println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/resume"),        style!(d, "restore saved session history"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "/why"),           style!(d, "show why last intent was chosen"));
     println!("{}   {:<18} {}", style!(v, "\u{2502}"), style!(h, "exit / quit"),    style!(d, "exit REM"));
     println!("{}", style!(v, "\u{2502}"));
     println!("{}  {}", style!(v, "\u{2502}"), style!(h, "\u{2500}\u{2500} TIPS \u{2500}\u{2500}"));
+    println!("{}   {} use {} to include file context: {}",
+        style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "@<path>"), style!(d, "@src/main.rs"));
     println!("{}   {} use {} to toggle between chat, code, and plan modes", style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "/mode"));
     println!("{}   {} {} for analysis first — REM explores codebase before coding", style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "/plan"));
     println!("{}   {} describe what you want \u{2014} REM detects intent", style!(v, "\u{2502}"), style!(d, "\u{2022}"));
     println!("{}   {} multi-file intent and auto-writes after confirmation", style!(v, "\u{2502}"), style!(d, "\u{2022}"));
     println!("{}   {} use {} {} {} for analysis, tests, and refactoring",
         style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "/explain"), style!(h, "/test"), style!(h, "/refactor"));
+    println!("{}   {} run {} for persistent project memory across sessions", style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "/init"));
     println!("{}   {} run {} to scaffold a new project instantly", style!(v, "\u{2502}"), style!(d, "\u{2022}"), style!(h, "rem new <name>"));
     println!("{}", style!(v, "\u{2502}"));
 }

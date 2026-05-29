@@ -1,5 +1,5 @@
 ### LlamaFactory QLoRA config for rem-llm
-model_name_or_path: deepseek-ai/deepseek-coder-1.3b-base
+model_name_or_path: Qwen/Qwen2.5-Coder-1.5B-Instruct
 stage: sft
 do_train: true
 finetuning_type: lora

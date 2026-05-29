@@ -10,8 +10,8 @@ domains:
   - terminal
 
 model:
-  base_model_hf: "deepseek-ai/deepseek-coder-1.3b-base"
-  base_model_ollama: "deepseek-coder:1.3b"
+  base_model_hf: "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+  base_model_ollama: "qwen2.5-coder:1.5b"
   output_name: "rem-coder-beginner"
 
 data:

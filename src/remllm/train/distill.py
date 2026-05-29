@@ -1,7 +1,7 @@
 """Knowledge distillation for coding LLMs.
 
-Distills knowledge from a larger teacher model (e.g., deepseek-coder-6.7b)
-into a smaller student model (e.g., deepseek-coder-1.3b) using KL divergence
+Distills knowledge from a larger teacher model (e.g., qwen2.5-coder-7b)
+into a smaller student model (e.g., qwen2.5-coder-1.5b) using KL divergence
 on sampled logits (Gemma-style: 256 logits per token).
 """
 
@@ -11,8 +11,8 @@ from pathlib import Path
 
 
 def distill_ollama(
-    teacher_model: str = "deepseek-coder:6.7b",
-    student_model: str = "deepseek-coder:1.3b",
+    teacher_model: str = "qwen2.5-coder:7b",
+    student_model: str = "qwen2.5-coder:1.5b",
     prompt: str = "",
     temperature: float = 2.0,
     timeout_s: int = 120,
@@ -60,8 +60,8 @@ def distill_ollama(
 def distill_dataset(
     input_path: Path,
     output_path: Path,
-    teacher_model: str = "deepseek-coder:6.7b",
-    student_model: str = "deepseek-coder:1.3b",
+    teacher_model: str = "qwen2.5-coder:7b",
+    student_model: str = "qwen2.5-coder:1.5b",
     temperature: float = 2.0,
     max_samples: int = 100,
 ) -> dict:

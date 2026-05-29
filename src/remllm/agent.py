@@ -51,7 +51,7 @@ def run_ollama(model: str, prompt: str, timeout_s: int = 120) -> str:
 
 def run_agent(
     task: str,
-    model: str = "deepseek-coder:1.3b",
+    model: str = "qwen2.5-coder:1.5b",
     project_dir: Optional[Path] = None,
     index_path: Optional[Path] = None,
     dry_run: bool = True,

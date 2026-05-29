@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MERGED_DIR="${ROOT_DIR}/models/rem-coder-merged"
 GGUF_DIR="${ROOT_DIR}/models/rem-coder-gguf"
-QUANT_LIST="${QUANT_LIST:-q4_k_m}"
+QUANT_LIST="${QUANT_LIST:-q3_k_m q4_k_m}"
 
 if [ ! -d "${MERGED_DIR}" ]; then
   echo "Merged model not found at ${MERGED_DIR}"

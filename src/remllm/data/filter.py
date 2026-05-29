@@ -8,7 +8,7 @@ from pathlib import Path
 
 def compute_perplexity_ollama(
     text: str,
-    model: str = "deepseek-coder:1.3b",
+    model: str = "qwen2.5-coder:1.5b",
     timeout_s: int = 60,
 ) -> float:
     eval_prompt = (
@@ -40,7 +40,7 @@ def compute_perplexity_ollama(
 def filter_by_perplexity(
     input_path: Path,
     output_path: Path,
-    model: str = "deepseek-coder:1.3b",
+    model: str = "qwen2.5-coder:1.5b",
     threshold: float = 5.0,
     max_samples: int = 0,
     timeout_s: int = 60,

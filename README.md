@@ -111,13 +111,13 @@ pip install llamafactory
 Run the full orchestrator:
 
 ```bash
-bash scripts/run_pipeline.sh deepseek-coder:1.3b rem-coder-trained
+bash scripts/run_pipeline.sh qwen2.5-coder:1.5b rem-coder-trained
 ```
 
 Fast iteration mode (skip dependency install and cached baseline eval):
 
 ```bash
-SKIP_DEPS=1 SKIP_BASELINE_IF_EXISTS=1 bash scripts/run_pipeline.sh deepseek-coder:1.3b rem-coder-trained
+SKIP_DEPS=1 SKIP_BASELINE_IF_EXISTS=1 bash scripts/run_pipeline.sh qwen2.5-coder:1.5b rem-coder-trained
 ```
 
 Pipeline outputs:
@@ -177,17 +177,17 @@ python3 -m remllm.cli data prepare --config config/domains/beginner_web_cli.yaml
 ```bash
 python3 scripts/evaluate_model.py \
   --config config/config.yaml \
-  --model deepseek-coder:1.3b \
+  --model qwen2.5-coder:1.5b \
   --report models/evals/baseline.json
 
 python3 scripts/evaluate_exec.py \
   --config config/config.yaml \
-  --model deepseek-coder:1.3b \
+  --model qwen2.5-coder:1.5b \
   --report models/evals/baseline_exec.json
 
 python3 -m remllm.cli eval beginner \
   --config config/domains/beginner_web_cli.yaml \
-  --model deepseek-coder:1.3b \
+  --model qwen2.5-coder:1.5b \
   --report models/evals/beginner_baseline.json
 ```
 
@@ -261,7 +261,7 @@ models/experiments/<run-id>/metadata.json
 Set a custom run id:
 
 ```bash
-RUN_ID=exp-20260518-01 bash scripts/run_pipeline.sh deepseek-coder:1.3b rem-coder-trained
+RUN_ID=exp-20260518-01 bash scripts/run_pipeline.sh qwen2.5-coder:1.5b rem-coder-trained
 ```
 
 ## Benchmark Model Variants

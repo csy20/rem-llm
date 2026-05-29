@@ -548,7 +548,7 @@ def main():
     dp_filter = dp_sub.add_parser("filter", help="Filter by perplexity/quality score")
     dp_filter.add_argument("input", help="Input JSONL path")
     dp_filter.add_argument("--output", required=True, help="Output JSONL path")
-    dp_filter.add_argument("--model", default="deepseek-coder:1.3b")
+    dp_filter.add_argument("--model", default="qwen2.5-coder:1.5b")
     dp_filter.add_argument(
         "--threshold", type=float, default=5.0, help="Minimum quality score"
     )
@@ -650,8 +650,8 @@ def main():
     tr_distill = tr_sub.add_parser("distill", help="Run knowledge distillation")
     tr_distill.add_argument("input", help="Input JSONL with instructions")
     tr_distill.add_argument("--output", required=True, help="Output JSONL path")
-    tr_distill.add_argument("--teacher", default="deepseek-coder:6.7b")
-    tr_distill.add_argument("--student", default="deepseek-coder:1.3b")
+    tr_distill.add_argument("--teacher", default="qwen2.5-coder:7b")
+    tr_distill.add_argument("--student", default="qwen2.5-coder:1.5b")
     tr_distill.add_argument("--temperature", type=float, default=2.0)
     tr_distill.add_argument("--max-samples", type=int, default=100)
 
@@ -704,7 +704,7 @@ def main():
     # agent
     ag = sub.add_parser("agent", help="Run coding agent with structured output")
     ag.add_argument("task", help="Task description for the agent")
-    ag.add_argument("--model", default="deepseek-coder:1.3b")
+    ag.add_argument("--model", default="qwen2.5-coder:1.5b")
     ag.add_argument("--project-dir", default=None, help="Project directory to index")
     ag.add_argument("--index-path", default=None, help="Path to codebase index JSON")
     ag.add_argument("--timeout-s", type=int, default=120)
@@ -718,7 +718,7 @@ def main():
     # pipeline
     pl = sub.add_parser("pipeline", help="Run full 7-phase pipeline")
     pl.add_argument("--config", default="config/config.yaml")
-    pl.add_argument("--base-model", default="deepseek-coder:1.3b")
+    pl.add_argument("--base-model", default="qwen2.5-coder:1.5b")
     pl.add_argument("--trained-model", default="rem-coder-trained")
 
     args = parser.parse_args()

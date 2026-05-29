@@ -125,5 +125,16 @@ echo "  Run:  ${BOLD}rem ask \"...\"${RESET}  — ask a coding question"
 echo "  Run:  ${BOLD}rem new <name>${RESET} — scaffold a project"
 echo ""
 echo "  ${DIM}Requires Ollama: https://ollama.com${RESET}"
-echo "  ${DIM}Recommended: ollama pull deepseek-coder:1.3b${RESET}"
+echo "  ${DIM}Recommended: ollama pull qwen2.5-coder:1.5b${RESET}"
 echo ""
+
+# ── Ollama environment hints ────────────────────────────────────────────────
+if command -v ollama &>/dev/null; then
+    warn "For low-RAM machines (4–6GB), set these env vars:"
+    echo ""
+    echo "  export OLLAMA_FLASH_ATTENTION=1    # 30-50% KV cache RAM savings"
+    echo "  export OLLAMA_KV_CACHE_TYPE=q8_0   # half precision KV cache"
+    echo "  export OLLAMA_MMAP=1               # mmap model load"
+    echo "  export OLLAMA_MAX_LOADED_MODELS=1  # keep one model loaded"
+    echo ""
+fi

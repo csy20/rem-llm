@@ -156,7 +156,7 @@ cargo run -- patch --file index.html --task "add a navigation bar"
 cargo run -- chat
 
 # if your model name is different
-cargo run -- --model deepseek-coder:1.3b chat
+cargo run -- --model qwen2.5-coder:1.5b chat
 ```
 
 ### Interactive mode example

@@ -6,8 +6,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "=== REM LLM Training (CPU Mode) ==="
 
-MODEL_NAME="deepseek-coder"
-MODEL_SIZE="1.3b"
+MODEL_NAME="qwen2.5-coder"
+MODEL_SIZE="1.5b"
 MODEL_TAG="${MODEL_NAME}:${MODEL_SIZE}"
 
 echo "Step 1: Verifying base model..."

@@ -18,10 +18,14 @@ mod feedback;
 mod intent;
 mod memory;
 mod ollama;
+mod provider;
+mod agentic;
 use feedback::FeedbackTracker;
 use intent::{classify_intent, has_creation_intent, has_file_path, intent_instruction, TaskIntent};
 use memory::ProjectMemory;
-use ollama::{api_url, OllamaClient, OllamaResponse};
+use ollama::OllamaResponse;
+use provider::{Provider, api_url};
+use agentic::{build_agentic_prompt, build_tool_context, extract_goal_signal, run_lint, run_test};
 
 static CTRL_C_COUNT: AtomicU8 = AtomicU8::new(0);
 
@@ -58,7 +62,7 @@ pub const C_WHITE_B: &str = "\x1b[1;37m";
 #[macro_export]
 macro_rules! style {
     ($color:ident, $($arg:tt)*) => {
-        format!("{}{}{}", $color, format!($($arg)*), C_RESET)
+        format!("{}{}{}", $color, format!($($arg)*), $crate::C_RESET)
     };
 }
 
@@ -151,6 +155,10 @@ struct Cli {
     model: Option<String>,
     #[arg(long, global = true, help = "Ollama API URL")]
     ollama_url: Option<String>,
+    #[arg(long, global = true, help = "Provider: ollama (default), openai, vllm")]
+    provider: Option<String>,
+    #[arg(long, global = true, help = "API key for OpenAI-compatible providers")]
+    api_key: Option<String>,
     #[arg(long, short = 'v', global = true, help = "Verbose output (show raw model responses)")]
     verbose: bool,
     #[command(subcommand)]
@@ -208,7 +216,15 @@ struct AppConfig {
     prompts_dir: Option<String>,
     #[serde(default)]
     workspace_dir: Option<String>,
+    #[serde(default = "default_provider")]
+    provider: String,
+    #[serde(default)]
+    api_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
 }
+
+fn default_provider() -> String { "ollama".to_string() }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -219,6 +235,9 @@ impl Default for AppConfig {
             max_context_bytes: 16_000,
             prompts_dir: None,
             workspace_dir: None,
+            provider: "ollama".to_string(),
+            api_url: None,
+            api_key: None,
         }
     }
 }
@@ -231,6 +250,9 @@ struct PartialConfig {
     max_context_bytes: Option<usize>,
     prompts_dir: Option<String>,
     workspace_dir: Option<String>,
+    provider: Option<String>,
+    api_url: Option<String>,
+    api_key: Option<String>,
 }
 
 impl AppConfig {
@@ -241,6 +263,9 @@ impl AppConfig {
         if let Some(v) = part.max_context_bytes { self.max_context_bytes = v; }
         if let Some(v) = part.prompts_dir { self.prompts_dir = Some(v); }
         if let Some(v) = part.workspace_dir { self.workspace_dir = Some(v); }
+        if let Some(v) = part.provider { self.provider = v; }
+        if let Some(v) = part.api_url { self.api_url = Some(v); }
+        if let Some(v) = part.api_key { self.api_key = Some(v); }
     }
 }
 
@@ -409,7 +434,7 @@ fn extract_code_blocks_with_names(text: &str) -> Vec<FileEntry> {
         }
 
         if let Some(name) = trimmed.strip_prefix("### ").or_else(|| trimmed.strip_prefix("## ")) {
-            current_name = name.trim().to_lowercase();
+            current_name = name.trim().to_string();
             continue;
         }
 
@@ -451,9 +476,30 @@ fn guess_filename(lines: &[&str]) -> String {
         if trimmed.starts_with("<!DOCTYPE") || trimmed.starts_with("<html") || trimmed.contains("<head") {
             return "index.html".to_string();
         }
+        if trimmed.starts_with("fn ") || trimmed.starts_with("pub ") || trimmed.starts_with("use ")
+            || trimmed.starts_with("mod ") || trimmed.starts_with("impl ") || trimmed.starts_with("trait ")
+            || trimmed.starts_with("#![") || trimmed.starts_with("extern crate")
+        {
+            return "main.rs".to_string();
+        }
+        if trimmed.starts_with("def ") || trimmed.starts_with("import ") || trimmed.starts_with("from ")
+            || trimmed.starts_with("class ") || trimmed.starts_with("if __name__")
+        {
+            return "main.py".to_string();
+        }
+        if trimmed.starts_with("package ") || trimmed.starts_with("func ") || trimmed.starts_with("type ")
+            || trimmed.starts_with("var (")
+        {
+            return "main.go".to_string();
+        }
+        if trimmed.starts_with("interface ") || trimmed.starts_with("export type")
+            || trimmed.starts_with("export interface") || trimmed.starts_with("declare ")
+            || trimmed.starts_with("namespace ") || trimmed.starts_with("import type")
+        {
+            return "index.ts".to_string();
+        }
         if trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("var ")
             || trimmed.starts_with("function ") || trimmed.starts_with("document.")
-            || trimmed.starts_with("import ") || trimmed.starts_with("export ")
             || trimmed.starts_with("fetch(") || trimmed.starts_with("addEventListener")
         {
             return "script.js".to_string();
@@ -466,6 +512,48 @@ fn guess_filename(lines: &[&str]) -> String {
         }
     }
     String::new()
+}
+
+fn resolve_safe_path(base: &Path, rel: &str) -> Option<PathBuf> {
+    let expanded = if rel.starts_with('~') {
+        if let Some(home) = dirs::home_dir() {
+            if rel == "~" || rel.starts_with("~/") {
+                home.join(rel.trim_start_matches("~/"))
+            } else {
+                PathBuf::from(rel)
+            }
+        } else {
+            PathBuf::from(rel)
+        }
+    } else {
+        PathBuf::from(rel)
+    };
+
+    let candidate = if expanded.is_relative() {
+        base.join(&expanded)
+    } else {
+        expanded
+    };
+
+    let resolved = match std::fs::canonicalize(&candidate) {
+        Ok(r) => r,
+        Err(_) => {
+            let parent = candidate.parent()?;
+            let canonical_parent = std::fs::canonicalize(parent).ok()?;
+            canonical_parent.join(candidate.file_name()?)
+        }
+    };
+
+    if resolved.starts_with(base) {
+        Some(resolved)
+    } else {
+        eprintln!(
+            "  {} path traversal blocked: {}",
+            style!(C_RED, "\u{2717}"),
+            style!(C_YELLOW, "{}", rel)
+        );
+        None
+    }
 }
 
 // ── Model reply schema ─────────────────────────────────────────────────────
@@ -778,15 +866,31 @@ async fn main() -> Result<()> {
     let mut cfg = load_config().unwrap_or_default();
     if let Some(m) = cli.model { cfg.model = m; }
     if let Some(url) = cli.ollama_url { cfg.ollama_url = url; }
+    if let Some(p) = cli.provider { cfg.provider = p; }
+    if let Some(k) = cli.api_key { cfg.api_key = Some(k); }
 
     if let Some(Commands::New(args)) = cli.command {
         return run_new(args, &cfg);
     }
 
     let system_prompt = load_system_prompt(cfg.prompts_dir.as_deref());
-    let mut client = OllamaClient::new(
-        cfg.ollama_url.clone(), cfg.model.clone(), cfg.timeout_s, system_prompt,
-    );
+    let base_url = cfg.api_url.clone().unwrap_or_else(|| cfg.ollama_url.clone());
+    let mut client = match cfg.provider.as_str() {
+        "openai" | "vllm" => {
+            let key = cfg.api_key.clone()
+                .unwrap_or_else(|| std::env::var("OPENAI_API_KEY").unwrap_or_default());
+            if key.is_empty() {
+                eprintln!("{}: provider '{}' requires --api-key or OPENAI_API_KEY",
+                    style!(C_YELLOW, "warning"), cfg.provider);
+            }
+            Provider::new_openai(
+                base_url, cfg.model.clone(), cfg.timeout_s, system_prompt, key,
+            )
+        }
+        _ => Provider::new_ollama(
+            base_url, cfg.model.clone(), cfg.timeout_s, system_prompt,
+        ),
+    };
     client.healthcheck().await?;
     let models = client.list_models().await?;
     if !models.iter().any(|m| m == &cfg.model) {
@@ -851,7 +955,7 @@ fn load_system_prompt(custom_prompts_dir: Option<&str>) -> String {
     DEFAULT_SYSTEM_PROMPT.to_string()
 }
 
-async fn run_pipe(client: &OllamaClient, _cfg: &AppConfig, input: &str, verbose: bool) -> Result<()> {
+async fn run_pipe(client: &Provider, _cfg: &AppConfig, input: &str, verbose: bool) -> Result<()> {
     let prompt = if input.len() > 12000 {
         format!("Analyze the following piped input. Be concise.\n\n{}...\n[truncated]", &input[..12000])
     } else {
@@ -878,7 +982,7 @@ async fn run_pipe(client: &OllamaClient, _cfg: &AppConfig, input: &str, verbose:
 
 // ── Subcommand handlers ────────────────────────────────────────────────────
 
-async fn run_ask(client: &OllamaClient, cfg: &AppConfig, args: AskArgs, verbose: bool) -> Result<()> {
+async fn run_ask(client: &Provider, cfg: &AppConfig, args: AskArgs, verbose: bool) -> Result<()> {
     let mut composed = args.prompt;
     if let Some(path) = args.file {
         let ctx = build_context(&path, cfg.max_context_bytes)?;
@@ -937,7 +1041,7 @@ async fn run_ask(client: &OllamaClient, cfg: &AppConfig, args: AskArgs, verbose:
     Ok(())
 }
 
-async fn run_explain(client: &OllamaClient, args: ExplainArgs) -> Result<()> {
+async fn run_explain(client: &Provider, args: ExplainArgs) -> Result<()> {
     print_banner(client);
     let prompt = format!("Explain this terminal command for a beginner and suggest a safer variant if needed: {}", args.command);
 
@@ -947,7 +1051,7 @@ async fn run_explain(client: &OllamaClient, args: ExplainArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_patch(client: &OllamaClient, cfg: &AppConfig, args: PatchArgs) -> Result<()> {
+async fn run_patch(client: &Provider, cfg: &AppConfig, args: PatchArgs) -> Result<()> {
     print_banner(client);
     let existing = fs::read_to_string(&args.file)
         .with_context(|| format!("failed to read {}", args.file.display()))?;
@@ -966,7 +1070,7 @@ async fn run_patch(client: &OllamaClient, cfg: &AppConfig, args: PatchArgs) -> R
 
 // ── Interactive chat ───────────────────────────────────────────────────────
 
-fn print_welcome(client: &OllamaClient) {
+fn print_welcome(client: &Provider) {
     let model_short = client.model.split(':').next().unwrap_or(&client.model);
     println!();
     println!("{}",
@@ -1066,7 +1170,7 @@ fn language_specific_guidance(project_type: &str) -> &'static str {
     }
 }
 
-fn build_prompt(session: &ChatSession, client: &OllamaClient) -> String {
+fn build_prompt(session: &ChatSession, client: &Provider) -> String {
     let model_short = client.model.split(':').next().unwrap_or(&client.model);
     let mode_color = match session.mode {
         RunMode::Chat => C_GREEN,
@@ -1092,7 +1196,7 @@ fn build_prompt(session: &ChatSession, client: &OllamaClient) -> String {
     p
 }
 
-async fn run_chat(client: &OllamaClient, cfg: &mut AppConfig, verbose: bool) -> Result<()> {
+async fn run_chat(client: &Provider, cfg: &mut AppConfig, verbose: bool) -> Result<()> {
     reset_ctrlc_count();
 
     let workspace = if let Some(ref dir) = cfg.workspace_dir {
@@ -1152,11 +1256,11 @@ async fn run_chat(client: &OllamaClient, cfg: &mut AppConfig, verbose: bool) -> 
         }
 
         if let Some(tail) = trimmed.strip_prefix("/write ") {
-            handle_write(&session, tail);
+            handle_write(&mut session, tail);
             continue;
         }
         if let Some(tail) = trimmed.strip_prefix("/save ") {
-            handle_write(&session, tail);
+            handle_write(&mut session, tail);
             continue;
         }
 
@@ -1679,75 +1783,69 @@ fn prompt_for_path(session: &mut ChatSession) -> io::Result<String> {
     }
 }
 
-fn handle_write(session: &ChatSession, path: &str) {
-    let file_path = PathBuf::from(path.trim());
-    let abs_path = if file_path.is_relative() {
-        if let Some(ref dir) = session.project_dir {
-            dir.join(&file_path)
-        } else {
-            std::env::current_dir().unwrap_or_default().join(&file_path)
-        }
-    } else {
-        file_path
+fn handle_write(session: &mut ChatSession, path: &str) {
+    let trimmed = path.trim();
+    let base_dir = session.project_dir.clone().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_default()
+    });
+
+    let abs_path = match resolve_safe_path(&base_dir, trimmed) {
+        Some(p) => p,
+        None => return,
     };
 
     if session.last_code.is_empty() {
         println!("  {} No code from last response. Use `/code` to view it.", style!(C_YELLOW, "!"));
         return;
     }
+
+    if abs_path.exists() {
+        let existing_size = fs::metadata(&abs_path).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "  {} {} exists ({} bytes) — {} [y/N]",
+            style!(C_YELLOW, "\u{26a0}"),
+            style!(C_WHITE_B, "{}", trimmed),
+            existing_size,
+            style!(C_DIM, "overwrite?")
+        );
+        let input = session.readline("rem> ").unwrap_or_else(|_| String::new());
+        if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
+            println!("  {} skipped", style!(C_DIM, "\u{2502}"));
+            return;
+        }
+    }
+
     if let Some(parent) = abs_path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("  {} cannot create directory {}: {}", style!(C_RED, "✗"), parent.display(), e);
+                eprintln!("  {} cannot create directory {}: {}", style!(C_RED, "\u{2717}"), parent.display(), e);
                 return;
             }
         }
     }
-    match fs::write(&abs_path, &session.last_code) {
-        Ok(()) => println!("  {} wrote {} ({} bytes)",
-            style!(C_GREEN, "✓"), style!(C_WHITE_B, "{}", abs_path.display()), session.last_code.len()),
-        Err(e) => println!("  {} failed: {}", style!(C_RED, "✗"), e),
+
+    let tmp = abs_path.with_extension("tmp");
+    match fs::write(&tmp, &session.last_code) {
+        Ok(()) => {
+            if let Err(e) = fs::rename(&tmp, &abs_path) {
+                eprintln!("  {} atomic write failed: {}", style!(C_RED, "\u{2717}"), e);
+                let _ = fs::remove_file(&tmp);
+                return;
+            }
+            println!("  {} wrote {} ({} bytes)",
+                style!(C_GREEN, "\u{2713}"), style!(C_WHITE_B, "{}", abs_path.display()), session.last_code.len());
+            session.last_files_written.push(abs_path);
+        }
+        Err(e) => {
+            println!("  {} failed: {}", style!(C_RED, "\u{2717}"), e);
+            let _ = fs::remove_file(&tmp);
+        }
     }
 }
 
 fn auto_write_files(session: &mut ChatSession, files: &[FileEntry]) {
     if files.is_empty() || files.iter().all(|f| f.path.is_empty()) {
-        println!("{} {} Type /write <path> to save.", style!(C_YELLOW, "│  !"), style!(C_DIM, ""));
-        return;
-    }
-
-    println!("{}", style!(C_CYAN, "│"));
-    println!("{} {} {}",
-        style!(C_CYAN, "│"),
-        style!(C_WHITE_B, "Plan: creating {} file(s)", files.len()),
-        style!(C_DIM, ""));
-    for f in files {
-        let icon = file_icon(&f.path);
-        if f.path.is_empty() {
-            println!("{}   {} {} ({})", style!(C_CYAN, "│"), icon,
-                style!(C_WHITE_B, "unnamed"), style!(C_DIM, "{} bytes", f.content.len()));
-        } else {
-            let lines = f.content.lines().count();
-            println!("{}   {} {} ({}, {} lines)",
-                style!(C_CYAN, "│"), icon,
-                style!(C_WHITE_B, "{}", f.path),
-                style!(C_DIM, "{} bytes", f.content.len()),
-                style!(C_DIM, "{}", lines));
-        }
-    }
-    println!("{}", style!(C_CYAN, "│"));
-    println!("{} {} {}",
-        style!(C_MAGENTA, "│  ?"),
-        style!(C_WHITE_B, "Write all {} files? [Y/n]", files.len()),
-        style!(C_DIM, "(press Enter to confirm)"));
-    println!("{} {}", style!(C_MAGENTA, "│"), style!(C_DIM, "  Type /code to preview, 'n' to cancel"));
-    println!("{}", style!(C_CYAN, "│"));
-
-    let input = session.readline("rem> ").unwrap_or_else(|_| String::from("y"));
-    let input = input.trim();
-    if !input.is_empty() && !input.eq_ignore_ascii_case("y") && !input.eq_ignore_ascii_case("yes") {
-        println!("{} {}", style!(C_YELLOW, "│  !"), "skipped. Use /write <path> to save individually.");
-        println!("{}", style!(C_CYAN, "│"));
+        println!("{} {} Type /write <path> to save.", style!(C_YELLOW, "\u{2502}  !"), style!(C_DIM, ""));
         return;
     }
 
@@ -1755,36 +1853,104 @@ fn auto_write_files(session: &mut ChatSession, files: &[FileEntry]) {
         std::env::current_dir().unwrap_or_default()
     });
 
-    let mut written: Vec<PathBuf> = Vec::new();
+    let mut safe_entries: Vec<(&FileEntry, PathBuf)> = Vec::new();
     for f in files {
-        let rel_path = PathBuf::from(&f.path);
-        let abs_path = if rel_path.is_relative() {
-            base_dir.join(&rel_path)
+        if f.path.is_empty() { continue; }
+        match resolve_safe_path(&base_dir, &f.path) {
+            Some(abs) => safe_entries.push((f, abs)),
+            None => {
+                eprintln!("{}   {} {} {}",
+                    style!(C_RED, "\u{2502} \u{2717}"),
+                    style!(C_WHITE_B, "{}", f.path),
+                    style!(C_DIM, "—"),
+                    style!(C_RED, "path traversal blocked"));
+            }
+        }
+    }
+
+    if safe_entries.is_empty() {
+        return;
+    }
+
+    println!("{}", style!(C_CYAN, "\u{2502}"));
+    println!("{} {} {}",
+        style!(C_CYAN, "\u{2502}"),
+        style!(C_WHITE_B, "Plan: creating {} file(s)", safe_entries.len()),
+        style!(C_DIM, ""));
+    for (f, abs_path) in &safe_entries {
+        let icon = file_icon(&f.path);
+        let lines = f.content.lines().count();
+        let marker = if abs_path.exists() {
+            style!(C_YELLOW, " [EXISTS]")
         } else {
-            rel_path
+            String::new()
         };
+        println!("{}   {} {} ({}, {} lines){}",
+            style!(C_CYAN, "\u{2502}"), icon,
+            style!(C_WHITE_B, "{}", f.path),
+            style!(C_DIM, "{} bytes", f.content.len()),
+            style!(C_DIM, "{}", lines),
+            marker);
+    }
+    println!("{}", style!(C_CYAN, "\u{2502}"));
+    println!("{} {} {}",
+        style!(C_MAGENTA, "\u{2502}  ?"),
+        style!(C_WHITE_B, "Write all {} files? [Y/n]", safe_entries.len()),
+        style!(C_DIM, "(press Enter to confirm)"));
+    println!("{} {}", style!(C_MAGENTA, "\u{2502}"), style!(C_DIM, "  Type /code to preview, 'n' to cancel"));
+    println!("{}", style!(C_CYAN, "\u{2502}"));
+
+    let input = session.readline("rem> ").unwrap_or_else(|_| String::from("y"));
+    let input = input.trim();
+    if !input.is_empty() && !input.eq_ignore_ascii_case("y") && !input.eq_ignore_ascii_case("yes") {
+        println!("{} {}", style!(C_YELLOW, "\u{2502}  !"), "skipped. Use /write <path> to save individually.");
+        println!("{}", style!(C_CYAN, "\u{2502}"));
+        return;
+    }
+
+    let mut written: Vec<PathBuf> = Vec::new();
+    for (f, abs_path) in &safe_entries {
+        let will_overwrite = abs_path.exists();
+        if will_overwrite {
+            println!(
+                "{}   {} {} {}",
+                style!(C_YELLOW, "\u{2502} \u{26a0}"),
+                style!(C_WHITE_B, "{}", f.path),
+                style!(C_DIM, "exists — overwriting"),
+                style!(C_DIM, ""));
+        }
 
         if let Some(parent) = abs_path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(e) = fs::create_dir_all(parent) {
                     eprintln!("{}   {} cannot create dir {}: {}",
-                        style!(C_RED, "│ ✗"), style!(C_WHITE_B, "{}", f.path), parent.display(), e);
+                        style!(C_RED, "\u{2502} \u{2717}"), style!(C_WHITE_B, "{}", f.path), parent.display(), e);
                     continue;
                 }
             }
         }
 
-        match fs::write(&abs_path, &f.content) {
+        let tmp = abs_path.with_extension("tmp");
+        match fs::write(&tmp, &f.content) {
             Ok(()) => {
-                println!("{}   {} {} ({} bytes)",
-                    style!(C_GREEN, "│ ✓"),
+                if let Err(e) = fs::rename(&tmp, &abs_path) {
+                    eprintln!("{}   {} atomic write failed: {}",
+                        style!(C_RED, "\u{2502} \u{2717}"), style!(C_WHITE_B, "{}", f.path), e);
+                    let _ = fs::remove_file(&tmp);
+                    continue;
+                }
+                let overwrite_note = if will_overwrite { " (overwritten)" } else { "" };
+                println!("{}   {} {} ({}{})",
+                    style!(C_GREEN, "\u{2502} \u{2713}"),
                     style!(C_WHITE_B, "{}", f.path),
-                    style!(C_DIM, ""),
-                    f.content.len());
-                written.push(abs_path);
+                    style!(C_DIM, "{} bytes", f.content.len()),
+                    style!(C_DIM, "{}", overwrite_note),
+                    String::new());
+                written.push(abs_path.clone());
             }
             Err(e) => {
-                println!("{}   {} {}: {}", style!(C_RED, "│ ✗"), style!(C_WHITE_B, "{}", f.path), style!(C_DIM, ""), e);
+                println!("{}   {} {}: {}", style!(C_RED, "\u{2502} \u{2717}"), style!(C_WHITE_B, "{}", f.path), style!(C_DIM, ""), e);
+                let _ = fs::remove_file(&tmp);
             }
         }
     }
@@ -1792,7 +1958,7 @@ fn auto_write_files(session: &mut ChatSession, files: &[FileEntry]) {
     if !written.is_empty() {
         session.last_files_written = written;
         println!("{} {} {} files written.",
-            style!(C_GREEN, "│ ✓"), style!(C_WHITE_B, "{}", session.last_files_written.len()), style!(C_DIM, ""));
+            style!(C_GREEN, "\u{2502} \u{2713}"), style!(C_WHITE_B, "{}", session.last_files_written.len()), style!(C_DIM, ""));
     }
 }
 
@@ -1802,37 +1968,49 @@ fn handle_undo(session: &mut ChatSession) {
         return;
     }
     println!("{} {}",
-        style!(C_MAGENTA, "│  ?"),
+        style!(C_MAGENTA, "\u{2502}  ?"),
         style!(C_WHITE_B, "Delete the last {} written file(s)? [y/N]", session.last_files_written.len()));
 
     let input = session.readline("rem> ").unwrap_or_else(|_| String::new());
     let input = input.trim();
     if !input.eq_ignore_ascii_case("y") && !input.eq_ignore_ascii_case("yes") {
-        println!("  {} cancelled", style!(C_DIM, "│"));
+        println!("  {} cancelled", style!(C_DIM, "\u{2502}"));
         return;
     }
 
     let mut removed = 0;
+    let mut dirs_to_clean: Vec<PathBuf> = Vec::new();
     for path in session.last_files_written.drain(..) {
         if path.exists() {
+            if let Some(parent) = path.parent() {
+                dirs_to_clean.push(parent.to_path_buf());
+            }
             match fs::remove_file(&path) {
                 Ok(()) => {
-                    println!("  {} removed {}", style!(C_YELLOW, "│"), style!(C_DIM, "{}", path.display()));
+                    println!("  {} removed {}", style!(C_YELLOW, "\u{2502}"), style!(C_DIM, "{}", path.display()));
                     removed += 1;
                 }
                 Err(e) => {
-                    println!("  {} failed to remove {}: {}", style!(C_RED, "│"), path.display(), e);
+                    println!("  {} failed to remove {}: {}", style!(C_RED, "\u{2502}"), path.display(), e);
                 }
             }
         }
     }
+
+    dirs_to_clean.sort_by(|a, b| b.as_os_str().len().cmp(&a.as_os_str().len()));
+    for dir in &dirs_to_clean {
+        if dir.exists() {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+
     if removed > 0 {
         let input = session.last_user_input.clone();
         let intent = session.last_intent.clone();
         if intent == TaskIntent::CodeAction {
             session.feedback.record_correction(&input, &intent, &TaskIntent::FastAnswer);
         }
-        println!("  {} {} {} file(s) removed.", style!(C_GREEN, "│ ✓"), removed, style!(C_DIM, ""));
+        println!("  {} {} {} file(s) removed.", style!(C_GREEN, "\u{2502} \u{2713}"), removed, style!(C_DIM, ""));
     }
 }
 
@@ -2036,7 +2214,7 @@ fn persist_workspace(dir: &Path) {
     }
 }
 
-async fn handle_search(client: &OllamaClient, session: &mut ChatSession, query: &str) {
+async fn handle_search(client: &Provider, session: &mut ChatSession, query: &str) {
     println!("{} {} searching the web...", style!(C_DIM, "│"), style!(C_CYAN, "🔍"));
     match perform_web_search(&client.client, query).await {
         Ok(results) => {
@@ -2054,7 +2232,7 @@ async fn handle_search(client: &OllamaClient, session: &mut ChatSession, query: 
     }
 }
 
-async fn handle_explain(client: &OllamaClient, session: &mut ChatSession, text: &str) {
+async fn handle_explain(client: &Provider, session: &mut ChatSession, text: &str) {
     if text.trim().is_empty() {
         println!("{} usage: /explain <code snippet>", style!(C_YELLOW, "│"));
         return;
@@ -2082,7 +2260,7 @@ async fn handle_explain(client: &OllamaClient, session: &mut ChatSession, text: 
     }
 }
 
-async fn handle_test(client: &OllamaClient, session: &mut ChatSession, path: &str) {
+async fn handle_test(client: &Provider, session: &mut ChatSession, path: &str) {
     let file_path = Path::new(path.trim());
     if !file_path.exists() {
         println!("{} file not found: {}", style!(C_YELLOW, "│"), path);
@@ -2126,7 +2304,7 @@ async fn handle_test(client: &OllamaClient, session: &mut ChatSession, path: &st
     }
 }
 
-async fn handle_refactor(client: &OllamaClient, session: &mut ChatSession, path: &str) {
+async fn handle_refactor(client: &Provider, session: &mut ChatSession, path: &str) {
     let file_path = Path::new(path.trim());
     if !file_path.exists() {
         println!("{} file not found: {}", style!(C_YELLOW, "│"), path);
@@ -2164,7 +2342,7 @@ async fn handle_refactor(client: &OllamaClient, session: &mut ChatSession, path:
     }
 }
 
-fn handle_config(session: &ChatSession, client: &OllamaClient) {
+fn handle_config(session: &ChatSession, client: &Provider) {
     println!("{}", style!(C_DIM, "\u{2502}"));
     println!("{}  {}{}", style!(C_CYAN, "\u{2502}"), style!(C_WHITE_B, "\u{2500}\u{2500} CONFIG \u{2500}\u{2500}"), style!(C_DIM, ""));
     println!("{}   {:<18} {}", style!(C_CYAN, "\u{2502}"), style!(C_WHITE_B, "model:"), style!(C_DIM, "{}", client.model));
@@ -2177,7 +2355,7 @@ fn handle_config(session: &ChatSession, client: &OllamaClient) {
     println!("{}", style!(C_CYAN, "\u{2502}"));
 }
 
-fn handle_config_set(session: &mut ChatSession, client: &OllamaClient, args: &str) {
+fn handle_config_set(session: &mut ChatSession, client: &Provider, args: &str) {
     let parts: Vec<&str> = args.splitn(2, ' ').collect();
     if parts.is_empty() {
         handle_config(session, client);
@@ -2200,7 +2378,7 @@ fn handle_config_set(session: &mut ChatSession, client: &OllamaClient, args: &st
 
 fn handle_diff(session: &ChatSession) {
     if session.last_files.is_empty() {
-        println!("{} No generated files to compare.", style!(C_YELLOW, "│"));
+        println!("{} No generated files to compare.", style!(C_YELLOW, "\u{2502}"));
         return;
     }
 
@@ -2208,9 +2386,9 @@ fn handle_diff(session: &ChatSession) {
         std::env::current_dir().unwrap_or_default()
     });
 
-    println!("{}", style!(C_DIM, "│"));
-    println!("{} {}{}", style!(C_CYAN, "│"), style!(C_WHITE_B, "--- DIFF ---"), style!(C_DIM, ""));
-    println!("{}", style!(C_DIM, "│"));
+    println!("{}", style!(C_DIM, "\u{2502}"));
+    println!("{} {}{}", style!(C_CYAN, "\u{2502}"), style!(C_WHITE_B, "--- DIFF ---"), style!(C_DIM, ""));
+    println!("{}", style!(C_DIM, "\u{2502}"));
 
     for f in &session.last_files {
         if f.path.is_empty() { continue; }
@@ -2226,26 +2404,48 @@ fn handle_diff(session: &ChatSession) {
             let existing = fs::read_to_string(&abs_path).unwrap_or_default();
             if existing == f.content {
                 println!("{} {} {} {}",
-                    style!(C_CYAN, "│"), icon,
+                    style!(C_CYAN, "\u{2502}"), icon,
                     style!(C_WHITE_B, "{}", f.path),
                     style!(C_DIM, "(unchanged)"));
             } else {
                 let added = f.content.lines().count().saturating_sub(existing.lines().count());
                 let removed = existing.lines().count().saturating_sub(f.content.lines().count());
                 println!("{} {} {} {}",
-                    style!(C_CYAN, "│"), icon,
+                    style!(C_CYAN, "\u{2502}"), icon,
                     style!(C_WHITE_B, "{}", f.path),
                     style!(C_DIM, ""));
                 if added > 0 {
-                    println!("{}   {} {}", style!(C_CYAN, "│"), style!(C_GREEN, "+{} lines", added), style!(C_DIM, ""));
+                    println!("{}   {} {}", style!(C_CYAN, "\u{2502}"), style!(C_GREEN, "+{} lines", added), style!(C_DIM, ""));
                 }
                 if removed > 0 {
-                    println!("{}   {} {}", style!(C_CYAN, "│"), style!(C_RED, "-{} lines", removed), style!(C_DIM, ""));
+                    println!("{}   {} {}", style!(C_CYAN, "\u{2502}"), style!(C_RED, "-{} lines", removed), style!(C_DIM, ""));
+                }
+                let old_lines: Vec<&str> = existing.lines().collect();
+                let new_lines: Vec<&str> = f.content.lines().collect();
+                let max_lines = old_lines.len().max(new_lines.len());
+                let mut diff_printed = 0;
+                for i in 0..max_lines {
+                    let old = old_lines.get(i).copied().unwrap_or("");
+                    let new = new_lines.get(i).copied().unwrap_or("");
+                    if old != new && diff_printed < 8 {
+                        if i < old_lines.len() && !old.is_empty() {
+                            println!("{}     {} {}",
+                                style!(C_DIM, "\u{2502}"), style!(C_RED, "-"), style!(C_RED, "{}", old));
+                        }
+                        if i < new_lines.len() && !new.is_empty() {
+                            println!("{}     {} {}",
+                                style!(C_DIM, "\u{2502}"), style!(C_GREEN, "+"), style!(C_GREEN, "{}", new));
+                        }
+                        diff_printed += 1;
+                    }
+                }
+                if max_lines > 8 && diff_printed > 0 {
+                    println!("{}     {}", style!(C_DIM, "\u{2502}"), style!(C_DIM, "..."));
                 }
             }
         } else {
             println!("{} {} {} {}",
-                style!(C_CYAN, "│"), icon,
+                style!(C_CYAN, "\u{2502}"), icon,
                 style!(C_WHITE_B, "{}", f.path),
                 style!(C_GREEN, "(new file) {} bytes", f.content.len()));
         }
@@ -2258,15 +2458,15 @@ fn handle_diff(session: &ChatSession) {
 
     if let Ok(output) = cmd {
         if !output.stdout.is_empty() {
-            println!("{}", style!(C_CYAN, "│"));
-            println!("{} {}", style!(C_CYAN, "│"), style!(C_DIM, "git diff --stat:"));
+            println!("{}", style!(C_CYAN, "\u{2502}"));
+            println!("{} {}", style!(C_CYAN, "\u{2502}"), style!(C_DIM, "git diff --stat:"));
             for line in String::from_utf8_lossy(&output.stdout).lines() {
-                println!("{}   {}", style!(C_CYAN, "│"), style!(C_DIM, "{}", line));
+                println!("{}   {}", style!(C_CYAN, "\u{2502}"), style!(C_DIM, "{}", line));
             }
         }
     }
 
-    println!("{}", style!(C_CYAN, "│"));
+    println!("{}", style!(C_CYAN, "\u{2502}"));
 }
 
 fn handle_tokens(session: &ChatSession) {
@@ -2375,7 +2575,7 @@ fn handle_init(session: &mut ChatSession) {
     println!("{}", style!(C_DIM, "│"));
 }
 
-async fn handle_compact(client: &OllamaClient, session: &mut ChatSession) {
+async fn handle_compact(client: &Provider, session: &mut ChatSession) {
     if session.history.is_empty() {
         println!("{} nothing to compact — history is empty", style!(C_YELLOW, "│"));
         return;
@@ -2399,32 +2599,41 @@ async fn handle_compact(client: &OllamaClient, session: &mut ChatSession) {
     }
 }
 
-async fn handle_goal(client: &OllamaClient, session: &mut ChatSession, condition: &str) {
-    println!("{}", style!(C_DIM, "│"));
-    println!("{} {} {}", style!(C_CYAN, "│"), style!(C_WHITE_B, "GOAL: {}", condition), style!(C_DIM, ""));
-    println!("{} {} {}", style!(C_CYAN, "│"), style!(C_DIM, ""), style!(C_DIM, "REM will work until goal is met. Ctrl+C to stop."));
-    println!("{}", style!(C_DIM, "│"));
+async fn handle_goal(client: &Provider, session: &mut ChatSession, condition: &str) {
+    println!("{}", style!(C_DIM, "\u{2502}"));
+    println!("{} {} {}", style!(C_CYAN, "\u{2502}"), style!(C_WHITE_B, "GOAL: {}", condition), style!(C_DIM, ""));
+    println!("{} {} {}", style!(C_CYAN, "\u{2502}"), style!(C_DIM, ""), style!(C_DIM, "REM will work until goal is met. Ctrl+C to stop."));
+    println!("{}", style!(C_DIM, "\u{2502}"));
 
     let goal_prompt_text = format!(
         "GOAL: {}\n\nYour task is to achieve this goal. You may need to:\n\
          1. Plan your approach\n\
-         2. Write code/files\n\
-         3. Test and verify\n\
-         4. Fix any issues\n\n\
+         2. Write code/files using ### path/file headings\n\
+         3. We will run tests/linters and report back\n\
+         4. Fix any issues based on tool output\n\n\
          When you believe the goal is achieved, say GOAL_ACHIEVED: <summary>.\n\
          If you are stuck, say GOAL_FAILED: <reason>.",
         condition
     );
 
     let max_iter = 10;
+    let mut last_tool_output = String::new();
+    let mut last_written_files: Vec<String> = Vec::new();
+
     for i in 0..max_iter {
         if i > 0 {
-            println!("{}", style!(C_DIM, "│"));
+            println!("{}", style!(C_DIM, "\u{2502}"));
         }
         println!("{} {} {}/{}",
-            style!(C_CYAN, "│"), style!(C_BOLD, "iteration"), i + 1, max_iter);
+            style!(C_CYAN, "\u{2502}"), style!(C_BOLD, "iteration"), i + 1, max_iter);
 
-        match client.complete_chat_stream(&goal_prompt_text, &CHAT_SYSTEM_PROMPT_CODE, "").await {
+        let prompt = if last_tool_output.is_empty() {
+            goal_prompt_text.clone()
+        } else {
+            build_agentic_prompt(&goal_prompt_text, &last_tool_output, i, max_iter)
+        };
+
+        match client.complete_chat_stream(&prompt, &CHAT_SYSTEM_PROMPT_CODE, "").await {
             Ok(text) => {
                 let cleaned = text.trim().to_string();
                 session.history.push((format!("/goal {}", condition), cleaned.clone()));
@@ -2435,29 +2644,59 @@ async fn handle_goal(client: &OllamaClient, session: &mut ChatSession, condition
                     session.last_files = files.clone();
                     session.last_code = if code.is_empty() { String::new() } else { code };
                     auto_write_files(session, &files);
+                    last_written_files = files.iter().map(|f| f.path.clone()).collect();
                 } else if !code.is_empty() {
                     session.last_code = code;
                     session.last_files.clear();
                     println!("{} {} use /write <path> to save",
-                        style!(C_CYAN, "│"), style!(C_DIM, "code detected —"));
+                        style!(C_CYAN, "\u{2502}"), style!(C_DIM, "code detected \u{2014}"));
+                }
+
+                if let Some((achieved, msg)) = extract_goal_signal(&cleaned) {
+                    if achieved {
+                        println!("{} {} goal achieved! {}", style!(C_GREEN, "\u{2502}"), style!(C_GREEN, "\u{2713}"), msg);
+                    } else {
+                        println!("{} {} {}", style!(C_YELLOW, "\u{2502}"), style!(C_YELLOW, "!"), msg);
+                    }
+                    break;
                 }
 
                 if cleaned.contains("GOAL_ACHIEVED") {
-                    println!("{} {} goal achieved!", style!(C_GREEN, "│"), style!(C_GREEN, "✓"));
+                    println!("{} {} goal achieved!", style!(C_GREEN, "\u{2502}"), style!(C_GREEN, "\u{2713}"));
                     break;
                 }
                 if cleaned.contains("GOAL_FAILED") {
-                    println!("{} {} goal could not be achieved.", style!(C_YELLOW, "│"), style!(C_YELLOW, "!"));
+                    println!("{} {} goal could not be achieved.", style!(C_YELLOW, "\u{2502}"), style!(C_YELLOW, "!"));
                     break;
+                }
+
+                if !last_written_files.is_empty() {
+                    let mut tool_results = String::new();
+                    for file_path in &last_written_files {
+                        let lint_result = run_lint(file_path);
+                        println!("{}", agentic::format_tool_output(&lint_result));
+
+                        let test_result = run_test(file_path);
+                        if !test_result.stderr.is_empty() || !test_result.stdout.is_empty() {
+                            println!("{}", agentic::format_tool_output(&test_result));
+                        }
+
+                        tool_results.push_str(&build_tool_context(
+                            Some(&lint_result),
+                            Some(&test_result),
+                            None,
+                        ));
+                    }
+                    last_tool_output = tool_results;
                 }
             }
             Err(e) => {
-                println!("{} {} error: {}", style!(C_RED, "│"), style!(C_RED, "✗"), e);
+                println!("{} {} error: {}", style!(C_RED, "\u{2502}"), style!(C_RED, "\u{2717}"), e);
                 break;
             }
         }
     }
-    println!("{}", style!(C_DIM, "│"));
+    println!("{}", style!(C_DIM, "\u{2502}"));
 }
 
 fn handle_copy(session: &ChatSession, n: usize) {
@@ -2556,7 +2795,7 @@ fn handle_lint(_session: &mut ChatSession, path: &str) {
     }
 }
 
-async fn handle_review(client: &OllamaClient, session: &mut ChatSession) {
+async fn handle_review(client: &Provider, session: &mut ChatSession) {
     if session.last_files.is_empty() {
         println!("{} no generated code to review", style!(C_YELLOW, "│"));
         return;
@@ -2608,15 +2847,21 @@ fn handle_save_session(session: &ChatSession) {
     let rem_dir = dir.join(".rem");
     let _ = fs::create_dir_all(&rem_dir);
     let session_file = rem_dir.join("session.json");
+    let last_files_json: Vec<serde_json::Value> = session.last_files.iter().map(|f| {
+        serde_json::json!({"path": f.path, "content": f.content})
+    }).collect();
     let data = serde_json::json!({
         "history": session.history.iter().map(|(u, a)| serde_json::json!({"user": u, "assistant": a})).collect::<Vec<_>>(),
         "mode": session.mode.label(),
         "workspace": session.project_dir.as_ref().map(|d| d.display().to_string()),
         "saved_at": chrono_now(),
+        "last_code": session.last_code,
+        "last_files": last_files_json,
+        "last_files_written": session.last_files_written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
     });
     match fs::write(&session_file, serde_json::to_string_pretty(&data).unwrap_or_default()) {
-        Ok(()) => println!("{} session saved to {}", style!(C_GREEN, "✓"), session_file.display()),
-        Err(e) => println!("{} failed to save session: {}", style!(C_RED, "✗"), e),
+        Ok(()) => println!("{} session saved to {}", style!(C_GREEN, "\u{2713}"), session_file.display()),
+        Err(e) => println!("{} failed to save session: {}", style!(C_RED, "\u{2717}"), e),
     }
 }
 
@@ -2632,7 +2877,7 @@ fn handle_resume_session(session: &mut ChatSession) {
     let dir = session.project_dir.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let session_file = dir.join(".rem/session.json");
     if !session_file.exists() {
-        println!("{} no saved session found at {}", style!(C_YELLOW, "│"), session_file.display());
+        println!("{} no saved session found at {}", style!(C_YELLOW, "\u{2502}"), session_file.display());
         return;
     }
     match fs::read_to_string(&session_file) {
@@ -2646,17 +2891,43 @@ fn handle_resume_session(session: &mut ChatSession) {
                             restored += 1;
                         }
                     }
-                    println!("{} restored {} turns from {}", style!(C_GREEN, "✓"), restored, session_file.display());
-                    println!("{} current conversation is now merged with saved session", style!(C_DIM, "│"));
-                    if let Some(m) = data["mode"].as_str() {
-                        println!("{} {} {}", style!(C_DIM, "│"), style!(C_DIM, "saved mode:"), style!(C_WHITE_B, "{}", m));
+                    println!("{} restored {} turns from {}", style!(C_GREEN, "\u{2713}"), restored, session_file.display());
+                    println!("{} current conversation is now merged with saved session", style!(C_DIM, "\u{2502}"));
+                }
+                if let Some(m) = data["mode"].as_str() {
+                    println!("{} {} {}", style!(C_DIM, "\u{2502}"), style!(C_DIM, "saved mode:"), style!(C_WHITE_B, "{}", m));
+                }
+                if let Some(code) = data["last_code"].as_str() {
+                    if !code.is_empty() {
+                        session.last_code = code.to_string();
+                        println!("{} {} {}", style!(C_DIM, "\u{2502}"), style!(C_DIM, "last code:"), style!(C_GREEN, "restored"));
+                    }
+                }
+                if let Some(files) = data["last_files"].as_array() {
+                    let restored_files: Vec<FileEntry> = files.iter().filter_map(|f| {
+                        Some(FileEntry {
+                            path: f["path"].as_str()?.to_string(),
+                            content: f["content"].as_str()?.to_string(),
+                        })
+                    }).collect();
+                    if !restored_files.is_empty() {
+                        println!("{} {} {} file(s) restored", style!(C_DIM, "\u{2502}"), style!(C_DIM, "last files:"), restored_files.len());
+                        session.last_files = restored_files;
+                    }
+                }
+                if let Some(paths) = data["last_files_written"].as_array() {
+                    let written: Vec<PathBuf> = paths.iter().filter_map(|p| {
+                        p.as_str().map(PathBuf::from)
+                    }).collect();
+                    if !written.is_empty() {
+                        session.last_files_written = written;
                     }
                 }
             } else {
-                println!("{} invalid session file", style!(C_RED, "│"));
+                println!("{} invalid session file", style!(C_RED, "\u{2502}"));
             }
         }
-        Err(e) => println!("{} failed to read session: {}", style!(C_RED, "│"), e),
+        Err(e) => println!("{} failed to read session: {}", style!(C_RED, "\u{2502}"), e),
     }
 }
 
@@ -2712,7 +2983,7 @@ fn print_chat_help() {
 
 // ── Output formatting ──────────────────────────────────────────────────────
 
-fn print_banner(client: &OllamaClient) {
+fn print_banner(client: &Provider) {
     println!();
     println!("{} {} {}",
         style!(C_CYAN, "╭─"),

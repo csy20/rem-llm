@@ -124,35 +124,78 @@ class StructuredOutput:
         results = []
         root = root_dir.resolve()
         for op in self.operations:
-            full_path = root_dir / op.path
+            full_path = root / op.path
             resolved = full_path.resolve()
-            if not str(resolved).startswith(str(root) + "/"):
+            if not str(resolved).startswith(str(root) + "/") and resolved != root:
                 results.append(f"REJECTED {op.path} (path traversal)")
                 continue
             if op.action == "create":
+                if op.content is None:
+                    results.append(f"SKIP {op.path} (no content)")
+                    continue
                 if not dry_run:
                     full_path.parent.mkdir(parents=True, exist_ok=True)
-                    full_path.write_text(op.content or "", encoding="utf-8")
+                    _atomic_write(full_path, op.content)
                 results.append(f"CREATE {op.path}")
             elif op.action == "modify":
                 if not dry_run:
                     if resolved.exists():
-                        resolved.write_text(op.content or "", encoding="utf-8")
-                    elif op.patch:
-                        existing = resolved.read_text(encoding="utf-8")
-                        resolved.write_text(
-                            existing + "\n" + op.patch, encoding="utf-8"
+                        if op.patch:
+                            try:
+                                existing = resolved.read_text(encoding="utf-8")
+                            except UnicodeDecodeError:
+                                existing = ""
+                            _atomic_write(resolved, existing + "\n" + op.patch)
+                        elif op.content is not None:
+                            _atomic_write(resolved, op.content)
+                        else:
+                            results.append(f"SKIP {op.path} (no content or patch)")
+                            continue
+                    elif op.content is not None:
+                        resolved.parent.mkdir(parents=True, exist_ok=True)
+                        _atomic_write(resolved, op.content)
+                    else:
+                        results.append(
+                            f"SKIP {op.path} (file does not exist, no content)"
                         )
-                    elif op.content:
-                        resolved.write_text(op.content, encoding="utf-8")
+                        continue
                 results.append(f"MODIFY {op.path}")
             elif op.action == "delete":
                 if not dry_run:
                     resolved.unlink(missing_ok=True)
                 results.append(f"DELETE {op.path}")
             elif op.action == "run":
-                results.append(f"RUN {op.path}")
+                if not dry_run:
+                    try:
+                        import subprocess
+
+                        proc = subprocess.run(
+                            op.path,
+                            shell=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            cwd=str(root_dir),
+                        )
+                        results.append(
+                            f"RUN {op.path} (exit={proc.returncode}) "
+                            f"out={proc.stdout[:200]} err={proc.stderr[:200]}"
+                        )
+                    except Exception as e:
+                        results.append(f"RUN FAILED {op.path}: {e}")
+                else:
+                    results.append(f"DRY-RUN {op.path}")
+            else:
+                results.append(f"UNKNOWN ACTION {op.action}")
         return results
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write to a temp file then rename for crash-safe atomic writes."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
 
 
 PROMPT_CHAT_BASE = """[MODE: CHAT]

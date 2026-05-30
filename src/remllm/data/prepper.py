@@ -14,6 +14,7 @@ from remllm.data.loader import (
     write_cache,
     write_jsonl,
 )
+from remllm.logging import get_logger
 
 
 def prepare_data(config_path: Path, force: bool = False) -> None:
@@ -29,6 +30,8 @@ def prepare_data(config_path: Path, force: bool = False) -> None:
     eval_path = root / data_cfg["eval_file"]
     cache_path = root / "data" / "prepare_cache.json"
 
+    log = get_logger(phase="data_prep", raw_file=str(raw_path))
+
     dataset_fingerprint = build_dataset_fingerprint(raw_path, seed, train_split)
     cache_payload = load_cache(cache_path)
     outputs_exist = train_path.exists() and val_path.exists() and eval_path.exists()
@@ -38,11 +41,13 @@ def prepare_data(config_path: Path, force: bool = False) -> None:
         and outputs_exist
         and cache_payload.get("fingerprint") == dataset_fingerprint
     ):
-        print("Data preparation skipped (cache hit)")
-        print(f"Fingerprint: {dataset_fingerprint['raw_sha256']}")
-        print(f"Train rows: {count_lines(train_path)} -> {train_path}")
-        print(f"Val rows: {count_lines(val_path)} -> {val_path}")
-        print(f"Eval rows: {count_lines(eval_path)} -> {eval_path}")
+        log.info(
+            "data_prep_cache_hit",
+            fingerprint=dataset_fingerprint["raw_sha256"],
+            train_rows=count_lines(train_path),
+            val_rows=count_lines(val_path),
+            eval_rows=count_lines(eval_path),
+        )
         return
 
     raw_rows = load_jsonl(raw_path)
@@ -80,13 +85,15 @@ def prepare_data(config_path: Path, force: bool = False) -> None:
         },
     )
 
-    print("Data preparation complete")
-    print(f"Raw rows: {len(raw_rows)}")
-    print(f"Dropped rows: {dropped}")
-    print(f"Train rows: {len(train_rows)} -> {train_path}")
-    print(f"Val rows: {len(val_rows)} -> {val_path}")
-    print(f"Eval rows: {len(eval_rows)} -> {eval_path}")
-    print(f"Fingerprint: {dataset_fingerprint['raw_sha256']}")
+    log.info(
+        "data_prep_complete",
+        raw_rows=len(raw_rows),
+        dropped_rows=dropped,
+        train_rows=len(train_rows),
+        val_rows=len(val_rows),
+        eval_rows=len(eval_rows),
+        fingerprint=dataset_fingerprint["raw_sha256"],
+    )
 
 
 def main():

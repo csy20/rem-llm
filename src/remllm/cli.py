@@ -395,6 +395,8 @@ def cmd_search(args: argparse.Namespace) -> None:
 
 
 def cmd_pipeline(args: argparse.Namespace) -> None:
+    from remllm.logging import get_logger
+
     root = Path.cwd()
     config_file = root / args.config
     base_model = args.base_model
@@ -409,43 +411,43 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
     run_dir = root / "models" / "experiments" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=== REM LLM 7-Phase Training Pipeline ===")
-    print(f"Run ID: {run_id}")
+    log = get_logger(run_id=run_id, base_model=base_model, trained_model=trained_model)
+    log.info("pipeline_start", phase="0/7")
 
-    print("[1/7] Install dependencies")
+    log.info("phase_install_deps", phase="1/7")
     if skip_deps:
-        print("Skipping (SKIP_DEPS=1)")
+        log.info("install_skipped", reason="SKIP_DEPS=1")
     else:
         subprocess.run(
             ["pip", "install", "-r", str(root / "requirements.txt")], check=False
         )
 
-    print("[2/7] Prepare datasets")
+    log.info("phase_prepare_data", phase="2/7")
     prepare_data(config_file)
 
     baseline_report = root / "models" / "evals" / "baseline.json"
     baseline_exec_report = root / "models" / "evals" / "baseline_exec.json"
 
-    print("[3/7] Baseline evaluation")
+    log.info("phase_baseline_eval", phase="3/7")
     if skip_baseline and baseline_report.exists():
-        print("Skipping (cached report exists)")
+        log.info("baseline_skipped", reason="cached report exists")
     else:
         rows, _, _ = _load_eval_rows(str(config_file))
         if rows:
             QualityEvaluator().evaluate(base_model, rows).write(baseline_report)
             ExecutableEvaluator().evaluate(base_model, rows).write(baseline_exec_report)
 
-    print("[4/7] QLoRA training")
+    log.info("phase_qlora_training", phase="4/7")
     from remllm.train.unsloth import train_unsloth
 
     train_unsloth(config_file)
 
-    print("[5/7] Merge adapter")
+    log.info("phase_merge_adapter", phase="5/7")
     from remllm.export.merge import merge_adapter
 
     merge_adapter(config_file)
 
-    print("[6/7] Export GGUF + package")
+    log.info("phase_export_gguf", phase="6/7")
     llama_cpp = os.environ.get("LLAMA_CPP_PATH", "")
     if llama_cpp:
         from remllm.export.gguf import export_gguf
@@ -467,9 +469,9 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
             root / "Modelfile.trained",
         )
     else:
-        print("Skipping (LLAMA_CPP_PATH not set)")
+        log.info("gguf_skipped", reason="LLAMA_CPP_PATH not set")
 
-    print("[7/7] Post-train evaluation + compare")
+    log.info("phase_post_train_eval", phase="7/7")
     rows, _, _ = _load_eval_rows(str(config_file))
     post_report = root / "models/evals/post_train.json"
     post_exec_report = root / "models/evals/post_train_exec.json"
@@ -479,7 +481,21 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
     compare_reports(
         baseline_report, post_report, baseline_exec_report, post_exec_report
     )
-    print("=== Pipeline complete ===")
+    log.info("pipeline_complete")
+
+
+def _start_server(args: argparse.Namespace) -> None:
+    try:
+        import uvicorn
+
+        uvicorn.run(
+            "remllm.api_server:app",
+            host=args.host,
+            port=args.port,
+            reload=args.reload,
+        )
+    except ImportError:
+        print("Install API dependencies: pip install fastapi uvicorn")
 
 
 def main():
@@ -721,6 +737,12 @@ def main():
     pl.add_argument("--base-model", default="qwen2.5-coder:1.5b")
     pl.add_argument("--trained-model", default="rem-coder-trained")
 
+    # serve
+    sv = sub.add_parser("serve", help="Start REST API server")
+    sv.add_argument("--host", default="0.0.0.0")
+    sv.add_argument("--port", type=int, default=8080)
+    sv.add_argument("--reload", action="store_true")
+
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
@@ -760,6 +782,7 @@ def main():
         )(a),
         "package": cmd_package,
         "pipeline": cmd_pipeline,
+        "serve": lambda a: _start_server(a),
     }
 
     handler = command_map.get(args.command)
